@@ -1,7 +1,7 @@
 import argparse
 import os, sys
 from pathlib import Path
-from .pipeline import init_project, reset_project, reset_stage, ocr, translate, correct, assemble, structure, build
+from .pipeline import init_project, reset_project, reset_stage, ocr, translate, correct, assemble, structure, structure_discovery, structure_refinement, build
 from .db import connect
 from .server import serve
 
@@ -28,12 +28,14 @@ def confirm_reset(scope):
 def main():
     p=argparse.ArgumentParser(prog='book2epub'); s=p.add_subparsers(dest='cmd',required=True)
     a=s.add_parser('init'); a.add_argument('project',type=Path); a.add_argument('--pdf',type=Path,required=True); a.add_argument('--source-lang'); a.add_argument('--target-lang')
-    a=s.add_parser('reset'); a.add_argument('project',type=Path); a.add_argument('--stage',choices=('ocr','correction','assembly','structure','translation','build')) ; a.add_argument('--out',type=Path,help='EPUB path when resetting build')
+    a=s.add_parser('reset'); a.add_argument('project',type=Path); a.add_argument('--stage',choices=('ocr','correction','assembly','structure','structure-discovery','structure-refinement','translation','build')) ; a.add_argument('--out',type=Path,help='EPUB path when resetting build')
     a=s.add_parser('ocr'); a.add_argument('project',type=Path); a.add_argument('--lang'); a.add_argument('--start',type=int,default=1); a.add_argument('--end',type=int); a.add_argument('--debug',action='store_true'); a.add_argument('--sample-pages',type=int,default=2,help='pages at beginning/end'); a.add_argument('--middle-pages',type=int,default=2,help='consecutive pages centered in the book'); a.add_argument('--sample-seed',type=int); a.add_argument('--sample-groups',default='beginning,middle,end')
     a=s.add_parser('translate'); a.add_argument('project',type=Path); a.add_argument('--target')
     a=s.add_parser('correct'); a.add_argument('project',type=Path); a.add_argument('--model'); a.add_argument('--source-lang'); a.add_argument('--debug',action='store_true'); a.add_argument('--sample-pages',type=int,default=2,help='pages at beginning/end'); a.add_argument('--middle-pages',type=int,default=2,help='consecutive pages centered in the book'); a.add_argument('--sample-seed',type=int); a.add_argument('--sample-groups',default='beginning,middle,end')
-    a=s.add_parser('assemble'); a.add_argument('project',type=Path); a.add_argument('--model'); a.add_argument('--window-size',type=int,default=3)
+    a=s.add_parser('assemble'); a.add_argument('project',type=Path); a.add_argument('--model'); a.add_argument('--window-size',type=int,help='pages per window; defaults to BOOK2EPUB_ASSEMBLY_WINDOW_SIZE or 6')
     a=s.add_parser('structure'); a.add_argument('project',type=Path); a.add_argument('--model'); a.add_argument('--chunk-size',type=int,default=80); a.add_argument('--debug',action='store_true')
+    a=s.add_parser('structure-discovery'); a.add_argument('project',type=Path); a.add_argument('--model'); a.add_argument('--chunk-size',type=int,default=80); a.add_argument('--debug',action='store_true')
+    a=s.add_parser('structure-refinement'); a.add_argument('project',type=Path); a.add_argument('--model'); a.add_argument('--chunk-size',type=int,default=80); a.add_argument('--debug',action='store_true')
     a=s.add_parser('serve'); a.add_argument('project',type=Path); a.add_argument('--host',default='127.0.0.1'); a.add_argument('--port',type=int,default=8765)
     a=s.add_parser('build'); a.add_argument('project',type=Path); a.add_argument('--out',type=Path,required=True)
     a=s.add_parser('costs'); a.add_argument('project',type=Path)
@@ -52,6 +54,10 @@ def main():
         assemble(x.project,model=x.model,window_size=x.window_size)
     elif x.cmd=='structure':
         structure(x.project,model=x.model,chunk_size=x.chunk_size,debug=x.debug)
+    elif x.cmd=='structure-discovery':
+        structure_discovery(x.project,model=x.model,chunk_size=x.chunk_size,debug=x.debug)
+    elif x.cmd=='structure-refinement':
+        structure_refinement(x.project,model=x.model,chunk_size=x.chunk_size,debug=x.debug)
     elif x.cmd=='serve':serve(x.project,x.host,x.port)
     elif x.cmd=='build':
         build(x.project,x.out)

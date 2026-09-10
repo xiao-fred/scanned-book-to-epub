@@ -92,6 +92,10 @@ commands print live `current/total` progress and can be safely resumed.
 
 After correction, run `assemble` to process only consecutive page windows,
 remove repeated page furniture, and join text split across page boundaries.
+The default assembly window is six pages with a one-page overlap; configure it
+with `BOOK2EPUB_ASSEMBLY_WINDOW_SIZE` or override it per CLI run with
+`--window-size N`. Values around four to six balance context, quality, and
+request time.
 Review assembled units at `http://127.0.0.1:8765/assembly`, then approve them
 before building the EPUB.
 
@@ -99,6 +103,12 @@ Correction also classifies semantic formatting (headings, quotes, captions,
 footnotes, lists, tables, and page furniture). Assembled body paragraphs over
 200 words are split at sentence boundaries; override this with
 `BOOK2EPUB_ASSEMBLY_MAX_WORDS` in the root `.env`.
+Structure performs chunked discovery once, then uses an agentic whole-tree
+refinement loop. On each refinement round the agent may request focused unit
+evidence or submit a complete revised hierarchy and front/main/back boundaries;
+invalid proposals are rejected without replacing the accepted tree. Five total
+rounds are the default; tune `BOOK2EPUB_STRUCTURE_MAX_ROUNDS` up to a hard limit
+of ten.
 
 Each hosted model attempt is also appended to
 `PROJECT/logs/model_requests.jsonl`. Entries include the input text, output
@@ -106,7 +116,9 @@ Each hosted model attempt is also appended to
 metadata. API keys are never written to this log.
 
 Run `python -m book2epub structure PROJECT` after assembly to infer a
-chapter/section hierarchy. Inspect the read-only result at
+chapter/section hierarchy. This compatibility command runs discovery and then
+whole-tree refinement. The phases can also be run independently with
+`structure-discovery` and `structure-refinement`; inspect saved versions at
 `http://127.0.0.1:8765/structure`.
 
 Network and HTTP failures are retried for every hosted LLM operation

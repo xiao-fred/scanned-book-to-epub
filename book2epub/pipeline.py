@@ -1,8 +1,14 @@
 from __future__ import annotations
 import hashlib, html, json, os, re, shutil, subprocess, uuid, zipfile, random, threading, time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 from .db import connect, meta_get, meta_set, cache_key, now, record_usage
+
+# Bump this whenever the assembly prompt or materialization semantics change.
+# Assembly responses are cached by content, so without an explicit algorithm
+# version a reset can replay results produced by an older implementation.
+ASSEMBLY_CACHE_VERSION = 'assembly-v5-lossless'
+CORRECTION_CACHE_VERSION = 'correction-v2'
 from .translation import translate_segment, load_dotenv
 
 _PROGRESS_HOOK = None
@@ -64,7 +70,7 @@ def reset_project(project):
         if child.is_dir(): shutil.rmtree(child)
         else: child.unlink()
     db=connect(project)
-    for table in ('blocks','pages','events','cache','usage_events','assembly_events','assembly_windows','manuscript_units','assembly_runs'):
+    for table in ('blocks','pages','events','cache','usage_events','assembly_events','assembly_windows','manuscript_units','assembly_runs','structure_nodes','structure_chunks','structure_runs'):
         db.execute(f'DELETE FROM {table}')
     db.execute('DELETE FROM metadata')
     meta_set(db,'source',str(source_path)); meta_set(db,'source_sha256',hashlib.sha256(source_path.read_bytes()).hexdigest())
@@ -75,7 +81,8 @@ def reset_project(project):
 def reset_stage(project, stage, output=None):
     """Reset one stage only; this function never starts processing."""
     db=connect(project)
-    db.execute('DELETE FROM usage_events WHERE stage=?',(stage,))
+    # Usage is an immutable billing/audit ledger. Reset derived stage output,
+    # but never erase costs already incurred by prior generations.
     db.execute('UPDATE stage_jobs SET completed=0,total=0,current=NULL,retry_count=0,failed_attempts=0,error=NULL,cancel_requested=0,last_progress_at=NULL,timing_samples_json=NULL,uncached_total=0,uncached_completed=0,eta_seconds=NULL WHERE stage=?',(stage,))
     if stage=='ocr':
         db.execute('DELETE FROM blocks'); db.execute('DELETE FROM pages'); db.execute("DELETE FROM metadata WHERE key IN ('page_count','debug_scope')")
@@ -92,7 +99,22 @@ def reset_stage(project, stage, output=None):
     elif stage=='assembly':
         db.execute('DELETE FROM assembly_reconciliation'); db.execute('DELETE FROM assembly_events'); db.execute('DELETE FROM manuscript_units'); db.execute('DELETE FROM assembly_windows'); db.execute('DELETE FROM assembly_runs')
     elif stage=='structure':
-        db.execute('DELETE FROM structure_nodes'); db.execute('DELETE FROM structure_chunks'); db.execute('DELETE FROM structure_runs')
+        db.execute('DELETE FROM structure_nodes'); db.execute('DELETE FROM structure_chunks'); db.execute('DELETE FROM structure_versions'); db.execute('DELETE FROM structure_runs')
+    elif stage=='structure-discovery':
+        db.execute('DELETE FROM structure_nodes'); db.execute('DELETE FROM structure_chunks'); db.execute('DELETE FROM structure_versions'); db.execute('DELETE FROM structure_runs')
+    elif stage=='structure-refinement':
+        run=db.execute('SELECT id FROM structure_runs ORDER BY generation DESC LIMIT 1').fetchone()
+        if run:
+            discovery=db.execute("SELECT * FROM structure_versions WHERE run_id=? AND phase='discovery' ORDER BY version LIMIT 1",(run['id'],)).fetchone()
+            db.execute("DELETE FROM structure_versions WHERE run_id=? AND phase!='discovery'",(run['id'],))
+            db.execute('DELETE FROM structure_nodes WHERE run_id=?',(run['id'],))
+            if discovery:
+                ids={}
+                for ordinal,node in enumerate(json.loads(discovery['tree_json']),1):
+                    parent_id=ids.get(node.get('parent_start_unit'))
+                    cur=db.execute('INSERT INTO structure_nodes(run_id,ordinal,parent_id,node_type,title,number,number_source,number_format,source_derived,heading_level,start_unit,end_unit,confidence,evidence_json,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(run['id'],ordinal,parent_id,node.get('node_type'),node.get('title'),node.get('number'),node.get('number_source','none'),node.get('number_format'),1,node.get('heading_level'),node.get('start_unit'),node.get('end_unit'),node.get('confidence'),node.get('evidence_json'),'needs_review')).lastrowid
+                    ids[node.get('start_unit')]=cur
+            db.execute("UPDATE structure_runs SET round=1,phase='discovery',status='needs_review',convergence=0,content_start_unit=NULL,backmatter_start_unit=NULL,completed=NULL WHERE id=?",(run['id'],))
     elif stage=='build':
         target=Path(output) if output else project/'book.epub'
         if target.exists(): target.unlink()
@@ -146,18 +168,159 @@ def _split_long(text, limit=200):
     return out
 
 def _provenance_refs(value):
-    """Normalize legacy and structured provenance to page/block references."""
+    """Normalize model provenance to canonical, globally unique block refs."""
     try: raw=json.loads(value) if isinstance(value,str) else (value or [])
     except Exception: raw=[]
     if isinstance(raw,(str,int)): raw=[raw]
     out=[]
     for item in raw:
-        if isinstance(item,dict) and item.get('page') is not None and item.get('block') is not None:
-            out.append({'page':int(item['page']),'block':int(item['block']),'key':f"{item['page']}:{item['block']}"})
-        elif isinstance(item,str) and ':' in item:
-            p,b=item.split(':',1)
-            if p.isdigit() and b.isdigit(): out.append({'page':int(p),'block':int(b),'key':item})
+        if isinstance(item,dict) and item.get('block') is not None:
+            try: page=int(item['page']) if item.get('page') is not None else None; block=int(item['block'])
+            except (TypeError,ValueError): continue
+            out.append({'page':page,'block':block,'key':f'block:{block}'})
+        elif isinstance(item,int) and not isinstance(item,bool):
+            out.append({'page':None,'block':item,'key':f'block:{item}'})
+        elif isinstance(item,str):
+            m=re.fullmatch(r'\s*(?:(\d+)\s*:\s*(\d+)|page\s*=\s*(\d+)\s+block\s*=\s*(\d+))\s*',item,re.I)
+            if m:
+                page,block=(m.group(1),m.group(2)) if m.group(1) is not None else (m.group(3),m.group(4))
+                out.append({'page':int(page),'block':int(block),'key':f'block:{int(block)}'})
     return out
+
+def _assembly_text_key(text):
+    return re.sub(r'\s+',' ',(text or '').strip().casefold())
+
+def _chapter_number(title):
+    m=re.match(r'^\s*(?:chapter|chapitre)?\s*(\d{1,3})[.)]?(?:\s+|$)',str(title or ''),re.I)
+    return int(m.group(1)) if m else None
+
+def _part_number(title):
+    m=re.match(r'^\s*(?:part|partie)\s+([0-9]+|[ivxlcdm]+)\b',str(title or ''),re.I)
+    if not m: return None
+    raw=m.group(1)
+    if raw.isdigit(): return int(raw),'arabic'
+    vals={'i':1,'v':5,'x':10,'l':50,'c':100,'d':500,'m':1000}; total=prev=0
+    for ch in raw.casefold()[::-1]:
+        v=vals.get(ch,0); total += -v if v<prev else v; prev=max(prev,v)
+    return total,'roman'
+
+def _structure_title_key(title):
+    value=re.sub(r'^\s*(?:chapitre\s*)?\d{1,3}[.)]?\s*','',str(title or ''),flags=re.I)
+    return re.sub(r'\W+',' ',value.casefold()).strip()
+
+def _reconcile_structure_candidates(units, candidates):
+    """Normalize anchors/types without making language-specific book decisions."""
+    unit_by_ordinal={int(u['ordinal']):u for u in units}
+    normalized=[]
+    for raw in candidates:
+        item=dict(raw); unit=item.get('unit',item.get('start_unit'))
+        try: unit=int(unit)
+        except (TypeError,ValueError): continue
+        source_unit=unit_by_ordinal.get(unit)
+        title=re.sub(r'\s+',' ',str(item.get('title') or (source_unit['text'] if source_unit else '')).strip())
+        if not title: continue
+        item['unit']=unit; item['title']=title
+        if item.get('node_type') not in ('part','chapter','section','subsection'): continue
+        if item['node_type'] in ('part','chapter'): item['heading_level']=1
+        normalized.append(item)
+    # Prefer explicit numbered/part candidates and collapse duplicate model +
+    # corrected candidates at one anchor.
+    normalized.sort(key=lambda x:(x['unit'],0 if _chapter_number(x['title']) is not None or x['node_type']=='part' else 1,-float(x.get('confidence') or 0)))
+    unique=[]; seen_units=set()
+    for item in normalized:
+        if item['unit'] in seen_units: continue
+        seen_units.add(item['unit']); unique.append(item)
+    # Remove the common OCR pair "17. TITLE" followed by an unnumbered copy
+    # of TITLE.  Same-anchor and adjacent-unit variants are both covered.
+    out=[]
+    for item in unique:
+        if out and item['unit']-out[-1]['unit']<=1 and _chapter_number(out[-1]['title']) is not None and _structure_title_key(item['title'])==_structure_title_key(out[-1]['title']):
+            continue
+        out.append(item)
+    # Retain a proven number-only chapter as an explicit boundary.  It is a
+    # warning, not a structural error; no title is invented.
+    warnings=[]
+    for item in out:
+        if item['node_type']=='chapter' and re.fullmatch(r'\s*(?:chapter|chapitre)?\s*\d+[.)]?\s*',item['title'],re.I):
+            warnings.append({'severity':'warning','issue':'chapter_title_missing','start_unit':item['unit'],'number':_chapter_number(item['title'])})
+    return out,warnings
+
+def _validate_structure_tree(nodes, content_start=None, backmatter_start=None):
+    errors=[]; warnings=[]; seen_titles=set(); seen_starts=set(); chapter_numbers=[]
+    chapter_anchors={int(n.get('unit',n.get('start_unit')) or 0) for n in nodes if n.get('node_type')=='chapter'}
+    for node in sorted(nodes,key=lambda n:int(n.get('unit',n.get('start_unit')) or 0)):
+        title=str(node.get('title') or '').strip(); ntype=node.get('node_type'); start=int(node.get('unit',node.get('start_unit')) or 0)
+        norm=_structure_title_key(title)
+        if start<=0 or start in seen_starts: errors.append({'severity':'error','issue':'duplicate_or_invalid_anchor','start_unit':start,'title':title})
+        if content_start and start<content_start: errors.append({'severity':'error','issue':'frontmatter_navigation_node','start_unit':start,'title':title})
+        if backmatter_start and start>=backmatter_start: errors.append({'severity':'error','issue':'backmatter_or_toc_navigation_node','start_unit':start,'title':title})
+        if norm and norm in seen_titles: errors.append({'severity':'error','issue':'duplicate_title','start_unit':start,'title':title})
+        if ntype not in ('part','chapter','section','subsection'): errors.append({'severity':'error','issue':'invalid_node_type','start_unit':start,'node_type':ntype})
+        if ntype in ('part','chapter') and node.get('parent_start_unit') is not None: errors.append({'severity':'error','issue':'top_level_has_parent','start_unit':start})
+        if ntype in ('section','subsection'):
+            parent=node.get('parent_start_unit')
+            try: parent=int(parent)
+            except (TypeError,ValueError): parent=None
+            if parent not in chapter_anchors or parent>=start: errors.append({'severity':'error','issue':'invalid_section_parent','start_unit':start,'parent_start_unit':parent,'title':title})
+        number=node.get('number') if ntype=='chapter' else None
+        try: number=int(number) if number is not None else _chapter_number(title)
+        except (TypeError,ValueError): number=_chapter_number(title)
+        if number is not None:
+            if number in [x[0] for x in chapter_numbers]: errors.append({'severity':'error','issue':'duplicate_chapter_number','number':number,'start_unit':start})
+            chapter_numbers.append((number,start))
+        if ntype=='chapter' and (not title or re.fullmatch(r'\s*(?:chapter|chapitre)?\s*\d+[.)]?\s*',title,re.I)): warnings.append({'severity':'warning','issue':'chapter_title_missing','number':number,'start_unit':start})
+        seen_starts.add(start)
+        if norm: seen_titles.add(norm)
+    for (a,au),(b,bu) in zip(chapter_numbers,chapter_numbers[1:]):
+        if b<=a: errors.append({'severity':'error','issue':'non_monotonic_chapter_numbers','previous':a,'current':b,'start_unit':bu})
+        elif b>a+1: warnings.append({'severity':'warning','issue':'chapter_number_gap','previous':a,'current':b,'start_unit':bu})
+    return errors,warnings
+
+def _structure_snapshot(db,run_id):
+    return [dict(r) for r in db.execute('''SELECT n.node_type,n.title,n.number,n.number_source,n.number_format,
+                    p.start_unit parent_start_unit,n.heading_level,n.start_unit,n.end_unit,n.confidence,n.evidence_json
+                FROM structure_nodes n LEFT JOIN structure_nodes p ON p.id=n.parent_id
+                WHERE n.run_id=? ORDER BY n.start_unit,n.ordinal''',(run_id,)).fetchall()]
+
+def _unit_source_evidence(db, unit):
+    """Return page/block evidence for an assembled unit.
+
+    This deliberately uses the authoritative block coordinates/order rather
+    than trusting the LLM's heading classification.  It lets structure
+    detection distinguish a chapter opening from a running page header.
+    """
+    refs = _provenance_refs(unit['provenance_json'])
+    out=[]
+    for ref in refs:
+        row=db.execute('''SELECT b.id,b.page_id,b.ordinal,b.corrected_kind,p.number
+                          FROM blocks b JOIN pages p ON p.id=b.page_id
+                          WHERE b.id=?''',(ref['block'],)).fetchone()
+        if row: out.append(dict(row))
+    return out
+
+def _is_running_header(db, unit, evidence):
+    """Conservatively reject headings at the top of a continuing page.
+
+    A real chapter opening may also be the first block on a page, so the
+    decisive signal is that the same page already contains body blocks after
+    the candidate and the preceding assembled unit belongs to that page.  The
+    source block must also be at the page edge or marked as page furniture.
+    """
+    if not evidence: return False
+    for item in evidence:
+        if item.get('ordinal') != 0 and item.get('corrected_kind') != 'page_furniture':
+            continue
+        page_id=item['page_id']
+        later=db.execute("SELECT COUNT(*) FROM blocks WHERE page_id=? AND ordinal>?",(page_id,item['ordinal'])).fetchone()[0]
+        if not later: continue
+        prior=db.execute('''SELECT 1 FROM manuscript_units u
+                            WHERE u.run_id=? AND u.ordinal<?
+                              AND EXISTS (SELECT 1 FROM json_each(u.provenance_json) j
+                                          WHERE CAST(json_extract(j.value,'$.block') AS INTEGER) IN
+                                          (SELECT id FROM blocks WHERE page_id=?))
+                            LIMIT 1''',(unit['run_id'],unit['ordinal'],page_id)).fetchone()
+        if prior: return True
+    return False
 def correct(project,provider='efficiency-center',model=None,debug=False,sample_pages=2,seed=None,groups='beginning,middle,end',batch_pages=1,source_lang=None,reset=False,middle_pages=2):
     load_dotenv(Path.cwd()/'.env')
     db=connect(project); source=source_lang or meta_get(db,'source_lang','eng')
@@ -177,30 +340,51 @@ def correct(project,provider='efficiency-center',model=None,debug=False,sample_p
     if not model:
         raise RuntimeError('Set BOOK2EPUB_CORRECTION_MODEL in the project .env or pass --model')
     work = [p for p in pages if p['number'] in selected]
-    targets=[(p,b) for p in work for b in db.execute('SELECT * FROM blocks WHERE page_id=? ORDER BY ordinal',(p['id'],)).fetchall()]
-    _progress('correction', 0, len(targets), 'paragraphs')
-    prompt='Return JSON with corrected_text, kind (paragraph, heading, subheading, blockquote, list_item, caption, footnote, table, page_furniture, unknown), heading_level, confidence, attributes, changes, unresolved. Correct and classify only this paragraph using the page image for visual context. Preserve meaning and never invent illegible text.'
-    def correct_one(item):
-        p,b=item; raw=b['text'] or ''
-        if not raw: return p,b,{'corrected_text':'','kind':'paragraph','confidence':1}, {'input_tokens':0,'output_tokens':0,'cost':0,'currency':'USD','model':'empty'}, 1, None
-        image=project/p['image']; key=cache_key('correction',raw,source,provider,model,f'v{generation}',str(image),str(b['id']))
+    page_groups=[]
+    try: max_words=max(1,int(os.environ.get('BOOK2EPUB_CORRECTION_MAX_WORDS_PER_PAGE','5000')))
+    except (TypeError,ValueError): max_words=5000
+    for p in work:
+        blocks=db.execute('SELECT * FROM blocks WHERE page_id=? ORDER BY ordinal',(p['id'],)).fetchall(); group=[]; words=0
+        for b in blocks:
+            n=len((b['text'] or '').split())
+            if group and words+n>max_words: page_groups.append((p,group)); group=[]; words=0
+            group.append(b); words+=n
+        if group: page_groups.append((p,group))
+    _progress('correction', 0, len(page_groups), 'pages')
+    prompt='Return JSON {"blocks":[{"block_id":number,"corrected_text":string,"kind":"paragraph|heading|subheading|blockquote|list_item|caption|footnote|table|page_furniture|unknown","heading_level":number|null,"confidence":number,"attributes":object,"changes":array,"unresolved":array}],"unresolved":array}. Correct and classify every supplied block using the complete page image and neighboring blocks. Preserve block IDs and order. A line at the very top or bottom may be a repeated running header/footer, not a chapter. Detect standalone printed chapter/part numbers immediately above titles and report attributes.chapter_number and attributes.number_source="printed". Do not infer numbers from sequence or invent illegible text.'
+    def request_page(item):
+        p,blocks=item; payload='\n\n'.join(f'[BLOCK {b["id"]}]\n{b["text"] or ""}' for b in blocks)
+        key=cache_key(CORRECTION_CACHE_VERSION,'page',payload,source,provider,model,f'v{generation}',str(p['image']))
         c=connect(project); cached=c.execute('SELECT value FROM cache WHERE key=?',(key,)).fetchone(); c.close()
-        if cached: return p,b,json.loads(cached[0]),{'input_tokens':0,'cached_input_tokens':0,'output_tokens':0,'cost':0,'currency':'USD','model':'cached','service_usages':[]},1,key
+        if cached: return p,blocks,json.loads(cached[0]),{'input_tokens':0,'output_tokens':0,'cost':0,'currency':'USD','model':'cached','service_usages':[]},1,key
         _worker_start_jitter('BOOK2EPUB_CORRECTION_START_JITTER')
-        out,usage=translate_segment(raw,source,source,provider,project/'.env',image,prompt,model)
+        out,usage=translate_segment(payload,source,source,provider,project/'.env',project/p['image'],prompt,model)
         try: result=json.loads(out)
-        except json.JSONDecodeError: result={'corrected_text':out,'kind':'paragraph','confidence':0.5,'changes':[],'unresolved':['model returned non-JSON']}
-        return p,b,result,usage,0,key
+        except json.JSONDecodeError: result={'blocks':[],'unresolved':['model returned non-JSON']}
+        return p,blocks,result,usage,0,key
     with ThreadPoolExecutor(max_workers=_workers('BOOK2EPUB_CORRECTION_WORKERS',3)) as pool:
-      futures=[pool.submit(correct_one,t) for t in targets]
+      futures=[pool.submit(request_page,g) for g in page_groups]
       for number,future in enumerate(futures,1):
-        _check_cancelled(); p,b,result,usage,hit,key=future.result()
+        _check_cancelled(); p,blocks,result,usage,hit,key=future.result()
         if key: db.execute('INSERT OR REPLACE INTO cache(key,value,created) VALUES(?,?,?)',(key,json.dumps(result,ensure_ascii=False),now()))
-        raw=b['text'] or ''
-        corrected=result.get('corrected_text',raw)
-        db.execute("UPDATE blocks SET corrected_text=?,correction_json=?,corrected_kind=?,corrected_heading_level=?,corrected_confidence=?,status='needs_review',revision=revision+1 WHERE id=?",(corrected,json.dumps(result,ensure_ascii=False),result.get('kind','paragraph'),result.get('heading_level'),result.get('confidence'),b['id']))
-        db.commit(); record_usage(db,run_id='correction',stage='correction',page_id=p['id'],block_id=b['id'],request_key=key,provider=provider,model=usage.get('model',model),input_tokens=usage.get('input_tokens',0),cached_input_tokens=usage.get('cached_input_tokens',0),output_tokens=usage.get('output_tokens',0),total_cost=usage.get('cost',0),currency=usage.get('currency','USD'),cache_hit=hit,details_json=json.dumps(usage.get('service_usages',[]),ensure_ascii=False),trace_id=usage.get('trace_id'),created=now())
-        _progress('correction', number, len(targets), f'paragraph {b["id"]}' + (' (cached)' if hit else ''))
+        returned={int(x['block_id']):x for x in (result.get('blocks') or []) if isinstance(x,dict) and str(x.get('block_id','')).isdigit()}
+        for b in blocks:
+            x=returned.get(b['id'])
+            if x is None:
+                fallback_prompt='Return JSON with corrected_text, kind, heading_level, confidence, attributes, changes, and unresolved. Correct only this OCR block using the page image. Preserve meaning; do not omit or invent text.'
+                fallback_key=cache_key(CORRECTION_CACHE_VERSION,'paragraph-fallback',b['text'] or '',source,provider,model,str(p['image']),str(b['id']))
+                cached_fallback=db.execute('SELECT value FROM cache WHERE key=?',(fallback_key,)).fetchone()
+                if cached_fallback:
+                    x=json.loads(cached_fallback[0]); fallback_usage={'model':'cached'}; fallback_hit=1
+                else:
+                    out,fallback_usage=translate_segment(b['text'] or '',source,source,provider,project/'.env',project/p['image'],fallback_prompt,model)
+                    try: x=json.loads(out)
+                    except json.JSONDecodeError: x={'corrected_text':b['text'] or '','kind':b['kind'] or 'paragraph','confidence':0.2,'unresolved':['paragraph fallback returned non-JSON']}
+                    db.execute('INSERT OR REPLACE INTO cache(key,value,created) VALUES(?,?,?)',(fallback_key,json.dumps(x,ensure_ascii=False),now())); fallback_hit=0
+                record_usage(db,run_id='correction',stage='correction',page_id=p['id'],block_id=b['id'],request_key=fallback_key,provider=provider,model=fallback_usage.get('model',model),input_tokens=fallback_usage.get('input_tokens',0),cached_input_tokens=fallback_usage.get('cached_input_tokens',0),output_tokens=fallback_usage.get('output_tokens',0),total_cost=fallback_usage.get('cost',0),currency=fallback_usage.get('currency','USD'),cache_hit=fallback_hit,details_json=json.dumps(fallback_usage.get('service_usages',[]),ensure_ascii=False),trace_id=fallback_usage.get('trace_id'),created=now())
+            db.execute("UPDATE blocks SET corrected_text=?,correction_json=?,corrected_kind=?,corrected_heading_level=?,corrected_confidence=?,status='needs_review',revision=revision+1 WHERE id=?",(x.get('corrected_text',b['text'] or ''),json.dumps(x,ensure_ascii=False),x.get('kind','paragraph'),x.get('heading_level'),x.get('confidence'),b['id']))
+        db.commit(); record_usage(db,run_id='correction',stage='correction',page_id=p['id'],request_key=key,provider=provider,model=usage.get('model',model),input_tokens=usage.get('input_tokens',0),cached_input_tokens=usage.get('cached_input_tokens',0),output_tokens=usage.get('output_tokens',0),total_cost=usage.get('cost',0),currency=usage.get('currency','USD'),cache_hit=hit,details_json=json.dumps(usage.get('service_usages',[]),ensure_ascii=False),trace_id=usage.get('trace_id'),created=now())
+        _progress('correction', number, len(page_groups), f'page {p["number"]}' + (' (cached)' if hit else ''))
     db.close()
 def translate(project,target=None,provider='hosted',run_id='translate',reset=False):
     load_dotenv(Path.cwd()/'.env')
@@ -219,9 +403,13 @@ def translate(project,target=None,provider='hosted',run_id='translate',reset=Fal
         _progress('translation', number, len(rows), f'block {r["id"]}' + (' (cached)' if hit else ''))
     meta_set(db,'target_lang',target); db.close()
 
-def assemble(project,provider='hosted',model=None,window_size=3,reset=False):
+def _assemble_generative_legacy(project,provider='hosted',model=None,window_size=None,reset=False):
     """Assemble only consecutive page windows into reviewable manuscript units."""
-    load_dotenv(Path.cwd()/'.env'); db=connect(project); source=meta_get(db,'source_lang','eng')
+    load_dotenv(Path.cwd()/'.env')
+    if window_size is None:
+        try: window_size=max(2,int(os.environ.get('BOOK2EPUB_ASSEMBLY_WINDOW_SIZE','6')))
+        except (TypeError,ValueError): window_size=6
+    db=connect(project); source=meta_get(db,'source_lang','eng')
     model=model or os.environ.get('BOOK2EPUB_ASSEMBLY_MODEL') or os.environ.get('BOOK2EPUB_CORRECTION_MODEL')
     if not model: raise RuntimeError('Set BOOK2EPUB_ASSEMBLY_MODEL or BOOK2EPUB_CORRECTION_MODEL')
     prior=db.execute('SELECT * FROM assembly_runs ORDER BY generation DESC LIMIT 1').fetchone()
@@ -254,7 +442,7 @@ def assemble(project,provider='hosted',model=None,window_size=3,reset=False):
                 txt=b['corrected_text'] or b['approved_text'] or b['text'] or ''; norm=re.sub(r'\s+',' ',txt.strip().lower())
                 if norm in repeated_furniture and (b['ordinal']==page_blocks[0]['ordinal'] or b['ordinal']==page_blocks[-1]['ordinal']): removed.append({'page':p['number'],'block':b['id'],'text':txt,'reason':'repeated edge text'}); continue
                 parts.append(f'[[page={p["number"]} block={b["id"]}]]\n{txt}'); provenance.append({'page':p['number'],'block':b['id']})
-        source_text='\n\n'.join(parts); window_key=','.join(str(p['number']) for p in window); key=cache_key('assembly',source_text,source,provider,model,str(generation),window_key)
+        source_text='\n\n'.join(parts); window_key=','.join(str(p['number']) for p in window); key=cache_key(ASSEMBLY_CACHE_VERSION,source_text,source,provider,model,str(generation),window_key)
         prompt=('Return JSON {"units":[{"text":...,"kind":"paragraph|heading|caption|footnote","source_blocks":[...],"confidence":...}],"removed":[...],"joins":[...],"unresolved":[...]}. Assemble only this consecutive page window. Remove repeated headers/footers, join page-boundary words/sentences, and preserve order. Do not invent text. Deterministic furniture candidates are: '+json.dumps(removed,ensure_ascii=False))
         return source_text, provenance, removed, key, prompt
     payloads={','.join(str(p['number']) for p in w):window_payload(w) for w in windows
@@ -270,9 +458,22 @@ def assemble(project,provider='hosted',model=None,window_size=3,reset=False):
         except json.JSONDecodeError: result={'units':[{'text':source_text,'kind':'paragraph','source_blocks':provenance,'confidence':0.4}],'removed':removed,'joins':[],'unresolved':['model returned non-JSON']}
         return wk,result,usage,0
     assembly_futures={}
-    with ThreadPoolExecutor(max_workers=_workers('BOOK2EPUB_ASSEMBLY_WORKERS',2)) as pool:
-        for wk,data in payloads.items(): assembly_futures[wk]=pool.submit(request_window,(wk,data))
-        # Futures run while the deterministic integration loop below consumes them.
+    # Keep only a small bounded set of requests in flight.  ``workers`` is the
+    # actual parallelism; this queue limit controls how far ahead we submit
+    # work and prevents hundreds of requests being queued at once.
+    # A context manager here would wait for *all* 206 requests on exit before
+    # the first result is integrated, making the UI appear stuck at 0/206.
+    workers=_workers('BOOK2EPUB_ASSEMBLY_WORKERS',2)
+    try: max_inflight=max(workers, min(workers*8, int(os.environ.get('BOOK2EPUB_ASSEMBLY_MAX_INFLIGHT', workers*2))))
+    except (TypeError, ValueError): max_inflight=workers*2
+    pool=ThreadPoolExecutor(max_workers=workers)
+    pending=iter(payloads.items())
+    def fill_queue():
+        while len(assembly_futures) < max_inflight:
+            try: wk,data=next(pending)
+            except StopIteration: break
+            assembly_futures[wk]=pool.submit(request_window,(wk,data))
+    fill_queue()
     ordinal=0; seen_blocks=set()
     for n,window in enumerate(windows,1):
         _check_cancelled()
@@ -292,13 +493,41 @@ def assemble(project,provider='hosted',model=None,window_size=3,reset=False):
                 '"source_blocks":[...],"confidence":...}],"removed":[...],"joins":[...],"unresolved":[...]}. '
                 'Assemble only this consecutive page window. Remove repeated headers/footers, join page-boundary words/sentences, and preserve order. '
                 'Do not invent text; report ambiguity in unresolved. Deterministic furniture candidates are: '+json.dumps(removed,ensure_ascii=False))
-        key=cache_key('assembly',source_text,source,provider,model,str(generation),','.join(str(p['number']) for p in window))
+        key=cache_key(ASSEMBLY_CACHE_VERSION,source_text,source,provider,model,str(generation),','.join(str(p['number']) for p in window))
         window_key=','.join(str(p['number']) for p in window)
         if db.execute('SELECT 1 FROM assembly_windows WHERE run_id=? AND window_key=?',(run,window_key)).fetchone():
             _progress('assembly',n,len(windows),f'pages {window[0]["number"]}-{window[-1]["number"]} (resumed)'); continue
         if window_key not in assembly_futures:
             _progress('assembly',n,len(windows),f'pages {window[0]["number"]}-{window[-1]["number"]} (resumed)'); continue
-        _,result,usage,hit=assembly_futures[window_key].result()
+        # Poll rather than blocking indefinitely on a model request, so Stop
+        # can be observed even when a provider is retrying or slow.
+        future=assembly_futures[window_key]
+        while True:
+            try:
+                _check_cancelled()
+            except Exception:
+                for pending_future in assembly_futures.values(): pending_future.cancel()
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            try:
+                _,result,usage,hit=future.result(timeout=0.5)
+                break
+            except FutureTimeout:
+                continue
+        del assembly_futures[window_key]
+        fill_queue()
+        # Persist usage for every assembly window so the dashboard's stage
+        # cost/token totals include both live and cached model requests.
+        record_usage(db, run_id=run, stage='assembly',
+                     page_id=window[0]['id'] if window else None,
+                     request_key=key, provider=provider,
+                     model=usage.get('model', model),
+                     input_tokens=usage.get('input_tokens', 0),
+                     cached_input_tokens=usage.get('cached_input_tokens', 0),
+                     output_tokens=usage.get('output_tokens', 0),
+                     total_cost=usage.get('cost', 0),
+                     currency=usage.get('currency', 'USD'),
+                     cache_hit=hit, created=now())
         result['removed']=removed + result.get('removed',[])
         if not hit: db.execute('INSERT OR REPLACE INTO cache(key,value,created) VALUES(?,?,?)',(key,json.dumps(result,ensure_ascii=False),now()))
         if 'removed' not in result: result['removed']=removed
@@ -312,6 +541,53 @@ def assemble(project,provider='hosted',model=None,window_size=3,reset=False):
             seen_blocks.update(ref_ids)
         db.execute('INSERT OR REPLACE INTO assembly_windows(run_id,window_key,result_json,status) VALUES(?,?,?,?)',(run,window_key,json.dumps(result,ensure_ascii=False),'completed'))
         db.commit(); _progress('assembly',n,len(windows),f'pages {window[0]["number"]}-{window[-1]["number"]}' + (' (cached)' if hit else ''))
+    pool.shutdown(wait=True)
+    # Re-materialize the manuscript stream from window results in global page
+    # order.  The previous implementation inserted units while processing and
+    # reset ``ordinal`` to zero on resume; completed windows could therefore
+    # receive duplicate ordinals or be appended after later windows.  Window
+    # results are the durable source of truth, so rebuild the stream once all
+    # available windows have been processed.
+    db.execute('DELETE FROM manuscript_units WHERE run_id=?',(run,))
+    db.execute('DELETE FROM assembly_reconciliation WHERE run_id=?',(run,))
+    materialized=[]; owners=set()
+    completed_windows=db.execute('SELECT window_key,result_json FROM assembly_windows WHERE run_id=? AND status=\'completed\'',(run,)).fetchall()
+    def window_start(key):
+        try: return int(str(key).split(',',1)[0])
+        except (TypeError,ValueError): return 10**9
+    for window in sorted(completed_windows,key=lambda r: window_start(r['window_key'])):
+        try: result=json.loads(window['result_json'] or '{}')
+        except Exception: result={}
+        # Build an exact-text fallback for model responses that omit or use an
+        # unsupported provenance shape.  Only unique matches are accepted.
+        try: page_nums=[int(x) for x in str(window['window_key']).split(',') if x]
+        except ValueError: page_nums=[]
+        block_rows=[]
+        for page_num in page_nums:
+            page_row=db.execute('SELECT id FROM pages WHERE number=?',(page_num,)).fetchone()
+            if page_row:
+                block_rows.extend(db.execute('SELECT id,page_id,text,approved_text,corrected_text FROM blocks WHERE page_id=? ORDER BY ordinal',(page_row['id'],)).fetchall())
+        exact_blocks={}
+        for block in block_rows:
+            text=_assembly_text_key(block['corrected_text'] or block['approved_text'] or block['text'])
+            if text: exact_blocks.setdefault(text,[]).append(block)
+        for unit in result.get('units',[]) or []:
+            refs=_provenance_refs(unit.get('source_blocks',[])); ref_keys={r['key'] for r in refs}
+            if not refs:
+                matches=exact_blocks.get(_assembly_text_key(unit.get('text')),[])
+                if len(matches)==1:
+                    block=matches[0]; page_num=db.execute('SELECT number FROM pages WHERE id=?',(block['page_id'],)).fetchone()['number']
+                    refs=[{'page':page_num,'block':block['id'],'key':f'block:{block["id"]}'}]; ref_keys={refs[0]['key']}
+            # Empty provenance is never allowed to duplicate a prior unit; it
+            # is retained only when the model supplied no provenance at all.
+            if ref_keys and ref_keys <= owners: continue
+            chunks=_split_long(unit.get('text',''),int(os.environ.get('BOOK2EPUB_ASSEMBLY_MAX_WORDS','200'))) if unit.get('kind','paragraph')=='paragraph' else [unit.get('text','')]
+            for chunk in chunks:
+                materialized.append((unit,chunk,refs,result))
+            owners.update(ref_keys)
+    for ordinal,(unit,chunk,refs,result) in enumerate(materialized,1):
+        db.execute('INSERT INTO manuscript_units(run_id,ordinal,kind,text,provenance_json,decisions_json,confidence,status) VALUES(?,?,?,?,?,?,?,?)',(run,ordinal,unit.get('kind','paragraph'),chunk,json.dumps(refs,ensure_ascii=False),json.dumps({'removed':result.get('removed',[]),'joins':result.get('joins',[]),'unresolved':result.get('unresolved',[]),'heading_level':unit.get('heading_level')},ensure_ascii=False),unit.get('confidence'),'needs_review'))
+    db.commit()
     # Global reconciliation across overlapping windows: keep the candidate
     # with the most complete provenance coverage and record every discard.
     candidates=db.execute('SELECT * FROM manuscript_units WHERE run_id=? ORDER BY ordinal',(run,)).fetchall(); owners={}; discard=[]
@@ -331,56 +607,499 @@ def assemble(project,provider='hosted',model=None,window_size=3,reset=False):
             for k in old_keys: owners[k]=unit['id']
         else:
             db.execute("UPDATE manuscript_units SET status='discarded' WHERE id=?",(unit['id'],)); db.execute('INSERT INTO assembly_reconciliation(run_id,candidate_unit_id,final_unit_id,action,reason,evidence_json,created) VALUES(?,?,?,?,?,?,?)',(run,unit['id'],existing['id'],'discarded_duplicate','less complete provenance',json.dumps({'kept_score':old_score,'discarded_score':score}),now()))
+    # Discarded overlap candidates leave holes in the provisional sequence;
+    # compact only surviving units so Structure receives a unique monotonic
+    # global ordinal stream.
+    active_units=db.execute("SELECT id FROM manuscript_units WHERE run_id=? AND status!='discarded' ORDER BY ordinal,id",(run,)).fetchall()
+    for ordinal,unit in enumerate(active_units,1):
+        db.execute('UPDATE manuscript_units SET ordinal=? WHERE id=?',(ordinal,unit['id']))
     db.execute('UPDATE assembly_runs SET status=?,completed=? WHERE id=?',('needs_review',now(),run)); db.commit(); db.close()
 
-def structure(project, model=None, reset=False, chunk_size=80, debug=False):
-    """Infer a compact chapter/section hierarchy from assembled units."""
+def assemble(project,provider='lossless',model=None,window_size=None,reset=False):
+    """Build a complete manuscript without allowing an LLM to rewrite text."""
+    load_dotenv(Path.cwd()/'.env')
+    if window_size is None:
+        try: window_size=max(2,int(os.environ.get('BOOK2EPUB_ASSEMBLY_WINDOW_SIZE','6')))
+        except (TypeError,ValueError): window_size=6
+    db=connect(project); source=meta_get(db,'source_lang','eng')
+    total_blocks=db.execute('SELECT COUNT(*) FROM blocks').fetchone()[0]
+    corrected=db.execute('SELECT COUNT(*) FROM blocks WHERE corrected_text IS NOT NULL').fetchone()[0]
+    if total_blocks and corrected < total_blocks:
+        db.close(); raise RuntimeError(f'Complete correction required before assembly ({corrected}/{total_blocks} blocks corrected)')
+    generation=db.execute('SELECT COALESCE(MAX(generation),0)+1 FROM assembly_runs').fetchone()[0]
+    run=db.execute('INSERT INTO assembly_runs(generation,source_lang,provider,model,window_size,status,created) VALUES(?,?,?,?,?,?,?)',
+                   (generation,source,'lossless',model or 'deterministic',window_size,'running',now())).lastrowid
+    pages=db.execute('SELECT * FROM pages ORDER BY number').fetchall()
+    page_blocks={p['id']:db.execute('SELECT * FROM blocks WHERE page_id=? ORDER BY ordinal,id',(p['id'],)).fetchall() for p in pages}
+
+    def norm(value): return re.sub(r'\s+',' ',str(value or '').strip()).casefold()
+    edge_counts={}
+    for p in pages:
+        bs=page_blocks[p['id']]
+        for b in ([bs[0],bs[-1]] if bs else []):
+            key=norm(b['corrected_text'] or b['approved_text'] or b['text'])
+            if key: edge_counts[key]=edge_counts.get(key,0)+1
+    repeated={key for key,count in edge_counts.items() if count>=3}
+    removed=[]; kept=[]
+    for p in pages:
+        bs=page_blocks[p['id']]
+        for index,b in enumerate(bs):
+            text=b['corrected_text'] if b['corrected_text'] is not None else (b['approved_text'] or b['text'] or '')
+            edge=index in (0,len(bs)-1); key=norm(text); reason=None
+            if edge and key in repeated: reason='repeated page-edge text'
+            elif edge and b['corrected_kind'] not in ('heading','subheading') and re.fullmatch(r'\s*\d{1,4}\s*',text or ''): reason='numeric page-edge page number'
+            if reason:
+                removed.append({'page':p['number'],'block':b['id'],'text':text,'reason':reason})
+            else:
+                if not str(text or '').strip(): continue
+                kept.append({'page':p['number'],'page_id':p['id'],'block':b['id'],'ordinal':b['ordinal'],
+                             'kind':b['corrected_kind'] or b['kind'] or 'paragraph','text':text,
+                             'confidence':b['corrected_confidence'] or b['confidence']})
+
+    def output_kind(kind):
+        if kind in ('heading','subheading'): return 'heading'
+        if kind in ('blockquote','caption','footnote','list_item','table'): return kind
+        return 'paragraph'
+    units=[]
+    for item in kept:
+        kind=output_kind(item['kind']); joined=False
+        if units and kind=='paragraph' and units[-1]['kind']=='paragraph' and item['page']==units[-1]['last_page']+1:
+            before=units[-1]['text'].rstrip(); after=item['text'].lstrip()
+            # Only a source-page continuation is joined. Block order remains
+            # authoritative and no prose is generated or paraphrased.
+            if before and after and not re.search(r'[.!?…:;»”\]\)]$',before) and re.match(r'^[a-zà-öø-ÿ«“(]',after):
+                units[-1]['text']=(before[:-1]+after if before.endswith('-') else before+' '+after)
+                units[-1]['refs'].append({'page':item['page'],'block':item['block'],'key':f'block:{item["block"]}'})
+                units[-1]['last_page']=item['page']; joined=True
+        if not joined:
+            units.append({'kind':kind,'text':item['text'],'refs':[{'page':item['page'],'block':item['block'],'key':f'block:{item["block"]}'}],
+                          'confidence':item['confidence'],'last_page':item['page']})
+
+    db.execute('DELETE FROM manuscript_units WHERE run_id=?',(run,)); db.execute('DELETE FROM assembly_reconciliation WHERE run_id=?',(run,))
+    for ordinal,unit in enumerate(units,1):
+        decisions={'algorithm':ASSEMBLY_CACHE_VERSION,'lossless':True,'joined_blocks':len(unit['refs'])>1}
+        db.execute('INSERT INTO manuscript_units(run_id,ordinal,kind,text,provenance_json,decisions_json,confidence,status) VALUES(?,?,?,?,?,?,?,?)',
+                   (run,ordinal,unit['kind'],unit['text'],json.dumps(unit['refs'],ensure_ascii=False),json.dumps(decisions),unit['confidence'],'needs_review'))
+    for item in removed:
+        db.execute('INSERT INTO assembly_reconciliation(run_id,action,reason,evidence_json,created) VALUES(?,?,?,?,?)',
+                   (run,'removed_furniture',item['reason'],json.dumps(item,ensure_ascii=False),now()))
+
+    groups=[]
+    for p in pages:
+        if not groups or p['number']!=groups[-1][-1]['number']+1: groups.append([p])
+        else: groups[-1].append(p)
+    stride=max(1,window_size-1); windows=[g[i:i+window_size] for g in groups for i in range(0,len(g),stride)]
+    _progress('assembly',0,len(windows),'lossless windows')
+    for n,window in enumerate(windows,1):
+        nums=[p['number'] for p in window]; result={'algorithm':ASSEMBLY_CACHE_VERSION,'pages':nums,'lossless':True,
+            'removed':[x for x in removed if x['page'] in nums]}
+        db.execute('INSERT INTO assembly_windows(run_id,window_key,result_json,status) VALUES(?,?,?,?)',
+                   (run,','.join(map(str,nums)),json.dumps(result,ensure_ascii=False),'completed'))
+        _progress('assembly',n,len(windows),f'pages {nums[0]}-{nums[-1]} · lossless')
+
+    expected=[x['block'] for x in kept]; actual=[]; markers=[]
+    for u in db.execute('SELECT ordinal,text,provenance_json FROM manuscript_units WHERE run_id=? ORDER BY ordinal',(run,)):
+        refs=_provenance_refs(u['provenance_json']); actual.extend(r['block'] for r in refs)
+        if re.search(r'\[\[\s*page\s*=',u['text'] or '',re.I): markers.append(u['ordinal'])
+    duplicate_ids=sorted(k for k,v in __import__('collections').Counter(actual).items() if v>1)
+    missing_ids=sorted(set(expected)-set(actual)); unexpected_ids=sorted(set(actual)-set(expected))
+    order_ok=actual==expected
+    report={'algorithm':ASSEMBLY_CACHE_VERSION,'run_id':run,'meaningful_blocks':len(expected),
+            'represented_blocks':len(set(actual)),'removed_furniture':removed,'missing_blocks':missing_ids,
+            'duplicate_blocks':duplicate_ids,'unexpected_blocks':unexpected_ids,'source_order_ok':order_ok,
+            'raw_marker_units':markers,'unit_count':len(units)}
+    errors=[]
+    if missing_ids: errors.append(f'{len(missing_ids)} corrected blocks missing')
+    if duplicate_ids: errors.append(f'{len(duplicate_ids)} corrected blocks duplicated')
+    if unexpected_ids: errors.append(f'{len(unexpected_ids)} unexpected blocks represented')
+    if not order_ok: errors.append('source block order changed')
+    if markers: errors.append(f'raw provenance markers in units {markers}')
+    report['errors']=errors; report['result']='fail' if errors else 'pass'
+    meta_set(db,'assembly_validation_report',report)
+    status='failed_validation' if errors else 'completed'
+    db.execute('UPDATE assembly_runs SET status=?,completed=? WHERE id=?',(status,now(),run)); db.commit(); db.close()
+    if errors: raise RuntimeError('Lossless assembly validation failed: '+'; '.join(errors))
+
+def _structure_once(project, model=None, reset=False, chunk_size=80, debug=False, round_no=1, prior_tree=None, prior_issues=None):
+    """Iteratively infer and validate a global chapter/section tree (max five rounds)."""
     load_dotenv(Path.cwd()/'.env'); db=connect(project)
     model=model or os.environ.get('BOOK2EPUB_STRUCTURE_MODEL') or os.environ.get('BOOK2EPUB_ASSEMBLY_MODEL') or os.environ.get('BOOK2EPUB_CORRECTION_MODEL')
     if not model: raise RuntimeError('Set BOOK2EPUB_STRUCTURE_MODEL, BOOK2EPUB_ASSEMBLY_MODEL, or BOOK2EPUB_CORRECTION_MODEL')
     assembly=db.execute("SELECT * FROM assembly_runs ORDER BY generation DESC LIMIT 1").fetchone()
     units=db.execute("SELECT * FROM manuscript_units WHERE run_id=? ORDER BY ordinal",(assembly['id'],)).fetchall() if assembly else []
     if not units: raise RuntimeError('Run assemble before structure')
+    if assembly['status']!='completed': raise RuntimeError(f'Assembly validation must pass before structure (status: {assembly["status"]})')
+    # Structure is a global, late-stage decision.  Do not infer hierarchy from
+    # a debug/partial correction run: every source block must have corrected
+    # text before the model sees the assembled book.
+    total_blocks=db.execute('SELECT COUNT(*) FROM blocks').fetchone()[0]
+    corrected_blocks=db.execute('SELECT COUNT(*) FROM blocks WHERE corrected_text IS NOT NULL').fetchone()[0]
+    if total_blocks and corrected_blocks < total_blocks:
+        raise RuntimeError(f'Complete correction required before structure ({corrected_blocks}/{total_blocks} blocks corrected)')
     prior=db.execute('SELECT * FROM structure_runs ORDER BY generation DESC LIMIT 1').fetchone()
     if prior and not reset and prior['model']==model and prior['assembly_run_id']==assembly['id'] and prior['status']!='completed': run_id,generation=prior['id'],prior['generation']; print(f'[structure] resuming generation {generation}',flush=True)
     else:
         generation=(db.execute('SELECT COALESCE(MAX(generation),0)+1 FROM structure_runs').fetchone()[0]); run_id=db.execute('INSERT INTO structure_runs(generation,source_lang,target_lang,model,status,assembly_run_id,created) VALUES(?,?,?,?,?,?,?)',(generation,meta_get(db,'source_lang','eng'),meta_get(db,'target_lang'),model,'running',assembly['id'],now())).lastrowid
+    phase='discovery' if round_no == 1 else 'repair'
+    db.execute('UPDATE structure_runs SET round=?,phase=? WHERE id=?',(round_no,phase,run_id)); db.commit()
     chunks=[units[i:i+chunk_size] for i in range(0,len(units),chunk_size)]
-    _progress('structure',0,len(chunks),'chunks')
-    summaries=[]
+    _progress('structure',0,len(chunks),f'round {round_no} · {phase} · chunks')
+    summaries=[]; unresolved=[]
     for n,chunk in enumerate(chunks,1):
         _check_cancelled()
-        key=f'{chunk[0]["ordinal"]}-{chunk[-1]["ordinal"]}'; cached=db.execute('SELECT result_json FROM structure_chunks WHERE run_id=? AND chunk_key=?',(run_id,key)).fetchone()
+        key=f'v5:r{round_no}:{chunk[0]["ordinal"]}-{chunk[-1]["ordinal"]}'; cached=db.execute('SELECT result_json FROM structure_chunks WHERE run_id=? AND chunk_key=?',(run_id,key)).fetchone()
         if cached: result=json.loads(cached[0]); hit=True
         else:
             text='\n'.join(f'[{u["ordinal"]}] ({u["kind"]}) {u["text"]}' for u in chunk)
-            prompt=('Return JSON {"headings":[{"title":...,"node_type":"chapter|section", "unit": number, "heading_level": number, "confidence": number, "evidence":...}], "toc_candidates": [...], "unresolved": [...]}. '
-                    'Identify high-level chapters and lower-level sections. Exclude running headers, footers, captions, and page furniture. Prefer source headings and meaningful boundaries.')
+            prompt=('Return JSON {"headings":[{"title":...,"node_type":"part|chapter|section|subsection", "unit": number, "heading_level": number, "confidence": number, "evidence":...}], "toc_candidates": [...], "unresolved": [...]}. '
+                    f'The unit field MUST be an absolute global assembled-unit ordinal from {chunk[0]["ordinal"]} through {chunk[-1]["ordinal"]}; never use a local 1-based position. '
+                    'Identify only headings supported by the supplied corrected/assembled text. Exclude running headers, footers, captions, page furniture, and page numbers. '
+                    'Prefer explicit numbered chapters; report ambiguity in unresolved and do not invent missing text.')
+            if round_no > 1:
+                prompt += ' This is a repair round. Preserve the existing structure unless an issue requires a change. Existing tree: '+json.dumps(prior_tree or [],ensure_ascii=False)+' Validation issues: '+json.dumps(prior_issues or [],ensure_ascii=False)
             out,usage=translate_segment(text,meta_get(db,'source_lang','eng'),meta_get(db,'source_lang','eng'),'hosted',project/'.env',None,prompt,model)
-            record_usage(db,run_id=f'structure-{run_id}',stage='structure',request_key=cache_key('structure',key),provider='hosted',model=usage.get('model',model),input_tokens=usage.get('input_tokens',0),cached_input_tokens=usage.get('cached_input_tokens',0),output_tokens=usage.get('output_tokens',0),total_cost=usage.get('cost',0),currency=usage.get('currency','USD'),cache_hit=0,details_json=json.dumps(usage.get('service_usages',[]),ensure_ascii=False),trace_id=usage.get('trace_id'),created=now())
+            record_usage(db,run_id=f'structure-{run_id}',stage='structure-discovery',request_key=cache_key('structure',key),provider='hosted',model=usage.get('model',model),input_tokens=usage.get('input_tokens',0),cached_input_tokens=usage.get('cached_input_tokens',0),output_tokens=usage.get('output_tokens',0),total_cost=usage.get('cost',0),currency=usage.get('currency','USD'),cache_hit=0,details_json=json.dumps(usage.get('service_usages',[]),ensure_ascii=False),trace_id=usage.get('trace_id'),created=now())
             try: result=json.loads(out)
             except json.JSONDecodeError: result={'headings':[],'toc_candidates':[],'unresolved':['model returned non-JSON']}
             db.execute('INSERT OR REPLACE INTO structure_chunks(run_id,chunk_key,result_json,status) VALUES(?,?,?,?)',(run_id,key,json.dumps(result,ensure_ascii=False),'completed')); db.commit(); hit=False
-        summaries.extend(result.get('headings',[])); _progress('structure',n,len(chunks),f'units {key}' + (' (cached)' if hit else ''))
+        # Validate cached and fresh responses alike. Cached rows may predate
+        # stricter response validation.
+        if not isinstance(result,dict):
+            result={'headings':[],'toc_candidates':[],'unresolved':['model returned a non-object JSON response']}
+        if not isinstance(result.get('headings'),list):
+            result['unresolved']=(result.get('unresolved') if isinstance(result.get('unresolved'),list) else [])+['model headings field was not a list']; result['headings']=[]
+        # Add corrected headings as deterministic candidates; the model can
+        # enrich hierarchy, but it cannot erase strong source evidence.
+        for u in chunk:
+            if u['kind'] in ('heading','subheading'):
+                evidence_rows=_unit_source_evidence(db,u)
+                running=_is_running_header(db,u,evidence_rows)
+                is_chapter = u['kind']=='heading' and (u['ordinal']==1 or str(u['text']).strip().isupper() or re.match(r'(?i)^\s*(chapter|chapitre)\b', str(u['text'])))
+                if running:
+                    unresolved.append({'issue':'running_header_demoted','unit':u['ordinal'],'title':u['text']})
+                    continue
+                ev={'source':'corrected_unit','source_blocks':[x['id'] for x in evidence_rows],
+                    'source_pages':[x['number'] for x in evidence_rows]}
+                summaries.append({'title':u['text'],'node_type':'chapter' if is_chapter else 'section','unit':u['ordinal'],'heading_level':1 if is_chapter else (2 if u['kind']=='subheading' else 1),'confidence':u['confidence'] or 0.8,'evidence':ev})
+        # Model suggestions are advisory: only accept them when they point to
+        # a global unit that is itself a corrected heading.  This prevents
+        # local 1-based positions (and duplicate competing nodes) from
+        # corrupting the hierarchy.
+        corrected_ordinals={u['ordinal'] for u in chunk if u['kind'] in ('heading','subheading') and not _is_running_header(db,u,_unit_source_evidence(db,u))}
+        for candidate in result.get('headings',[]):
+            if not isinstance(candidate,dict):
+                unresolved.append({'issue':'invalid_candidate','candidate':candidate}); continue
+            try: cu=int(candidate.get('unit'))
+            except (TypeError,ValueError): unresolved.append({'issue':'invalid_unit','candidate':candidate}); continue
+            if not (chunk[0]['ordinal'] <= cu <= chunk[-1]['ordinal']): unresolved.append({'issue':'out_of_range_unit','candidate':candidate}); continue
+            if cu in corrected_ordinals:
+                candidate['unit']=cu; summaries.append(candidate)
+        unresolved.extend(result.get('unresolved',[]) or [])
+        _progress('structure',n,len(chunks),f'round {round_no} · {phase} · units {key}' + (' (cached)' if hit else ''))
+    if round_no > 1:
+        # Preserve unchanged nodes after applying repair candidates.  The
+        # sorted/dedup pass below gives current-round edits precedence.
+        summaries.extend({'title':old.get('title'),'node_type':old.get('node_type','section'),'unit':old.get('start_unit'),'heading_level':old.get('heading_level'),'confidence':old.get('confidence'),'evidence':{'source':'previous_round'}} for old in (prior_tree or []))
+    # Deterministically repair a common OCR split: a chapter number followed
+    # immediately by its title.  Keep the number's unit as the chapter anchor.
+    summaries.sort(key=lambda x: int(x.get('unit') or 10**9))
+    merged=[]; i=0
+    while i < len(summaries):
+        cur=summaries[i]
+        if i+1 < len(summaries) and re.fullmatch(r'\s*(?:chapter|chapitre)?\s*\d+[.)]?\s*', str(cur.get('title','')), re.I):
+            nxt=summaries[i+1]
+            try: adjacent=int(nxt.get('unit')) == int(cur.get('unit')) + 1
+            except (TypeError,ValueError): adjacent=False
+            if adjacent:
+                nxt=dict(nxt); nxt['title']=f'{cur.get("title")} {nxt.get("title")}'.strip(); nxt['unit']=cur.get('unit'); nxt['node_type']='chapter'; nxt['heading_level']=1
+                merged.append(nxt); i+=2; continue
+        merged.append(cur); i+=1
+    summaries=merged
+    summaries,reconcile_warnings=_reconcile_structure_candidates(units,summaries)
+    content_start=None; backmatter_start=None
+    unresolved.extend(reconcile_warnings)
     # Global reconciliation is deterministic over candidates; this keeps the
     # stage resumable and avoids an unbounded full-book request.
-    db.execute('DELETE FROM structure_nodes WHERE run_id=?',(run_id,)); summaries=sorted(summaries,key=lambda x:x.get('unit',0)); seen=set(); ordinal=0; stack=[]
+    db.execute('DELETE FROM structure_nodes WHERE run_id=?',(run_id,))
+    # Models may emit ``unit: null`` (or a non-numeric value).  Sorting those
+    # directly against integer unit numbers raises ``NoneType < int`` and
+    # aborts the whole structure stage.  Normalize only valid unit numbers and
+    # leave invalid candidates to be skipped below.
+    def heading_unit(item):
+        try:
+            value=item.get('unit')
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+    summaries=sorted(summaries,key=lambda x:(heading_unit(x) is None, heading_unit(x) or 0)); seen=set(); ordinal=0; last_chapter_id=None
     for h in summaries:
-        title=re.sub(r'\s+',' ',str(h.get('title','')).strip()); unit=int(h.get('unit',0) or 0)
+        title=re.sub(r'\s+',' ',str(h.get('title','')).strip()); unit=heading_unit(h) or 0
+        if heading_unit(h) is None or heading_unit(h) <= 0: continue
+        unit=heading_unit(h)
         norm=title.casefold()
-        if not title or norm in seen or h.get('node_type') not in ('chapter','section'): continue
-        seen.add(norm); ordinal+=1; level=int(h.get('heading_level') or (1 if h.get('node_type')=='chapter' else 2)); parent_id=stack[level-2][0] if level>1 and len(stack)>=level-1 else None
-        cur=db.execute('INSERT INTO structure_nodes(run_id,ordinal,parent_id,node_type,title,source_derived,heading_level,start_unit,end_unit,confidence,evidence_json,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(run_id,ordinal,parent_id,h.get('node_type','section'),title,1,level,unit,None,h.get('confidence'),json.dumps(h.get('evidence',{}),ensure_ascii=False),'needs_review')).lastrowid
-        stack=stack[:level-1]; stack.append((cur,level))
-    db.execute('UPDATE structure_runs SET status=?,completed=? WHERE id=?',('needs_review',now(),run_id)); db.commit(); db.close(); print(f'[structure] generated {ordinal} nodes; inspect with /structure',flush=True)
+        if not title or norm in seen or h.get('node_type') not in ('part','chapter','section','subsection'): continue
+        seen.add(norm); ordinal+=1; level=min(6,max(1,int(h.get('heading_level') or (1 if h.get('node_type')=='chapter' else 2))))
+        # A chapter is always top-level.  Prevent malformed model levels from
+        # nesting a chapter below another chapter.
+        if h.get('node_type') in ('part','chapter'): level=1
+        # Sections always belong to the nearest preceding top-level chapter.
+        # This remains true even when correction supplied a generic heading
+        # classification or the model returned an invalid level.
+        if h.get('node_type') in ('section','subsection'):
+            parent_id=last_chapter_id
+            level=max(2,level)
+        else:
+            parent_id=None
+        num=_chapter_number(title) if h.get('node_type')=='chapter' else (_part_number(title)[0] if h.get('node_type')=='part' and _part_number(title) else None)
+        evidence=h.get('evidence') if isinstance(h.get('evidence'),dict) else {'raw':h.get('evidence')}
+        nsrc='printed' if num is not None else str(evidence.get('number_source','none'))
+        nformat='arabic' if num is not None else None
+        cur=db.execute('INSERT INTO structure_nodes(run_id,ordinal,parent_id,node_type,title,number,number_source,number_format,source_derived,heading_level,start_unit,end_unit,confidence,evidence_json,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(run_id,ordinal,parent_id,h.get('node_type','section'),title,num,nsrc,nformat,1,level,unit,None,h.get('confidence'),json.dumps(evidence,ensure_ascii=False),'needs_review')).lastrowid
+        if h.get('node_type')=='chapter': last_chapter_id=cur
+    nodes=db.execute('SELECT id,ordinal,start_unit FROM structure_nodes WHERE run_id=? ORDER BY start_unit,ordinal',(run_id,)).fetchall()
+    for i,node in enumerate(nodes):
+        end=(nodes[i+1]['start_unit']-1) if i+1 < len(nodes) else units[-1]['ordinal']
+        db.execute('UPDATE structure_nodes SET end_unit=? WHERE id=?',(max(node['start_unit'],end),node['id']))
+    db.execute('UPDATE structure_runs SET status=?,completed=?,unresolved_json=?,candidate_count=?,content_start_unit=?,backmatter_start_unit=? WHERE id=?',('needs_review',now(),json.dumps(unresolved,ensure_ascii=False),len(summaries),content_start,backmatter_start,run_id))
+    snapshot=_structure_snapshot(db,run_id)
+    fp=hashlib.sha256(json.dumps(snapshot,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
+    ver=(db.execute('SELECT COALESCE(MAX(version),0)+1 FROM structure_versions WHERE run_id=?',(run_id,)).fetchone()[0])
+    db.execute('INSERT INTO structure_versions(run_id,version,phase,tree_json,issues_json,fingerprint,quality_score,accepted,created) VALUES(?,?,?,?,?,?,?,?,?)',(run_id,ver,phase,json.dumps(snapshot,ensure_ascii=False),json.dumps(unresolved,ensure_ascii=False),fp,max(0,1-len(unresolved)/max(1,len(snapshot))),1,now()))
+    db.commit(); db.close(); print(f'[structure] generated {ordinal} nodes; saved version {ver} ({phase})',flush=True)
+
+def structure_discovery(project, model=None, chunk_size=80, debug=False):
+    """Run only the first, chunked discovery pass."""
+    _structure_once(project, model=model, reset=False, chunk_size=chunk_size, debug=debug, round_no=1)
+
+def structure_refinement(project, model=None, chunk_size=80, debug=False):
+    """Refine the entire persisted candidate tree in one call per round."""
+    load_dotenv(Path.cwd()/'.env'); db=connect(project)
+    run=db.execute('SELECT * FROM structure_runs ORDER BY generation DESC LIMIT 1').fetchone()
+    if not run: db.close(); raise RuntimeError('Run structure-discovery before structure-refinement')
+    model=model or os.environ.get('BOOK2EPUB_STRUCTURE_MODEL') or os.environ.get('BOOK2EPUB_ASSEMBLY_MODEL') or os.environ.get('BOOK2EPUB_CORRECTION_MODEL')
+    try: max_rounds=min(10,max(2,int(os.environ.get('BOOK2EPUB_STRUCTURE_MAX_ROUNDS','5'))))
+    except (TypeError,ValueError): max_rounds=5
+    start=max(2,int(run['round'] or 1)+1); previous=run['fingerprint']; inspection_evidence=[]
+    for round_no in range(start,max_rounds+1):
+        _check_cancelled()
+        tree=_structure_snapshot(db,run['id'])
+        all_units=db.execute('SELECT * FROM manuscript_units WHERE run_id=? ORDER BY ordinal',(run['assembly_run_id'],)).fetchall()
+        unit_map={u['ordinal']:u for u in all_units}
+        evidence=[]
+        for u in all_units:
+            if u['kind'] not in ('heading','subheading'): continue
+            context=[]
+            for ordinal in range(max(1,u['ordinal']-2),min(all_units[-1]['ordinal'],u['ordinal']+2)+1):
+                x=unit_map.get(ordinal)
+                if x: context.append({'ordinal':ordinal,'kind':x['kind'],'text':x['text']})
+            evidence.append({'ordinal':u['ordinal'],'kind':u['kind'],'text':u['text'],'context':context})
+        running_headers=[]
+        for u in db.execute("SELECT * FROM manuscript_units WHERE run_id=? AND kind IN ('heading','subheading')",(run['assembly_run_id'],)).fetchall():
+            ev=_unit_source_evidence(db,u)
+            if _is_running_header(db,u,ev): running_headers.append({'start_unit':u['ordinal'],'title':u['text'],'pages':[x['number'] for x in ev]})
+        issues=json.loads(run['validation_issues_json'] or '[]')
+        _progress('structure-refinement',round_no-1,max_rounds-1,f'round {round_no}/{max_rounds} · whole-tree refinement')
+        prompt=('You are the structure-refinement agent. Work only on the structural model; never reproduce book prose. You may either inspect evidence or propose the complete refined model. Return JSON {"action":"inspect|propose","inspect_units":[number],"content_start_unit":number,"backmatter_start_unit":number|null,"nodes":[{"title":string|null,"node_type":"part|chapter|section|subsection","number":number|null,"number_source":"printed|inferred|none","start_unit":number,"heading_level":number,"parent_start_unit":number|null,"confidence":number,"evidence":object}],"changes":[],"unresolved":[],"done":boolean}. '
+                'Inspect when evidence is insufficient; request at most 40 unit ordinals. A proposal must be the entire tree derived from the existing accepted model. Determine front/main/back zones from evidence, merge OCR-split headings and duplicate number/title nodes, exclude printed contents and page furniture, keep Parts and Chapters top-level, and nest sections/subsections beneath Chapters. Preserve printed chapter numbers and infer only uniquely established gaps. A proven number-only chapter is valid when no title is supported. Existing accepted tree: '+json.dumps(tree,ensure_ascii=False)+' Deterministic validation feedback: '+json.dumps(issues,ensure_ascii=False)+' Heading neighborhoods: '+json.dumps(evidence,ensure_ascii=False)+' Requested inspection evidence: '+json.dumps(inspection_evidence,ensure_ascii=False)+' Running-header evidence: '+json.dumps(running_headers,ensure_ascii=False))
+        key=cache_key('structure-agent-v1',str(round_no),hashlib.sha256(json.dumps(tree,sort_keys=True).encode()).hexdigest(),hashlib.sha256(json.dumps(issues,sort_keys=True).encode()).hexdigest(),hashlib.sha256(json.dumps(inspection_evidence,sort_keys=True).encode()).hexdigest())
+        cached=db.execute('SELECT result_json FROM structure_chunks WHERE run_id=? AND chunk_key=?',(run['id'],key)).fetchone()
+        if cached: result=json.loads(cached[0]); hit=1
+        else:
+            out,usage=translate_segment(json.dumps(tree,ensure_ascii=False),meta_get(db,'source_lang','eng'),meta_get(db,'source_lang','eng'),'hosted',project/'.env',None,prompt,model)
+            try: result=json.loads(out)
+            except json.JSONDecodeError: result={'action':'inspect','inspect_units':[],'unresolved':[{'severity':'error','issue':'agent_returned_non_json'}]}
+            db.execute('INSERT INTO structure_chunks(run_id,chunk_key,result_json,status) VALUES(?,?,?,?)',(run['id'],key,json.dumps(result,ensure_ascii=False),'completed'))
+            record_usage(db,run_id=f'structure-{run["id"]}',stage='structure-refinement',request_key=key,provider='hosted',model=usage.get('model',model),input_tokens=usage.get('input_tokens',0),cached_input_tokens=usage.get('cached_input_tokens',0),output_tokens=usage.get('output_tokens',0),total_cost=usage.get('cost',0),currency=usage.get('currency','USD'),cache_hit=0,created=now()); hit=0
+        action=result.get('action','propose'); proposed=result.get('nodes') or []; validation=[]
+        if action=='inspect':
+            requested=[]
+            for value in (result.get('inspect_units') or [])[:40]:
+                try: center=int(value)
+                except (TypeError,ValueError): continue
+                for ordinal in range(max(1,center-4),min(all_units[-1]['ordinal'],center+4)+1):
+                    u=unit_map.get(ordinal)
+                    if u: requested.append({'ordinal':ordinal,'kind':u['kind'],'text':u['text'],'provenance':u['provenance_json']})
+            inspection_evidence=requested
+            current=_structure_snapshot(db,run['id'])
+            fp=hashlib.sha256(json.dumps(current,ensure_ascii=False,sort_keys=True).encode()).hexdigest(); note=[{'severity':'info','issue':'agent_requested_inspection','units':result.get('inspect_units',[])[:40]}]
+            ver=db.execute('SELECT COALESCE(MAX(version),0)+1 FROM structure_versions WHERE run_id=?',(run['id'],)).fetchone()[0]
+            db.execute('INSERT INTO structure_versions(run_id,version,phase,tree_json,issues_json,fingerprint,quality_score,accepted,changes_json,created) VALUES(?,?,?,?,?,?,?,?,?,?)',(run['id'],ver,'agent_inspection',json.dumps(current,ensure_ascii=False),json.dumps(note,ensure_ascii=False),fp,run['quality_score'] or 0,0,json.dumps(result.get('changes') or [],ensure_ascii=False),now()))
+            status='failed_validation' if round_no==max_rounds else 'needs_review'
+            db.execute('UPDATE structure_runs SET round=?,max_rounds=?,phase=?,validation_issues_json=?,last_repair_summary=?,status=?,completed=? WHERE id=?',(round_no,max_rounds,'agent_inspection',json.dumps(note,ensure_ascii=False),json.dumps(result.get('changes') or [],ensure_ascii=False),status,now() if status=='failed_validation' else None,run['id']))
+            db.commit(); run=db.execute('SELECT * FROM structure_runs WHERE id=?',(run['id'],)).fetchone(); _progress('structure-refinement',round_no-1,max_rounds-1,f'round {round_no} · inspecting {len(requested)} evidence units'+(' (cached)' if hit else '')); continue
+        # Running-header candidates are evidence for the agent, not a semantic
+        # deletion rule. The validator only enforces structural safety.
+        proposed,reconcile_warnings=_reconcile_structure_candidates(all_units,proposed)
+        try: content_start=int(result.get('content_start_unit')); backmatter_start=int(result['backmatter_start_unit']) if result.get('backmatter_start_unit') is not None else all_units[-1]['ordinal']+1
+        except (TypeError,ValueError): content_start=0; backmatter_start=0
+        boundary_errors=[]
+        if not (1<=content_start<backmatter_start<=all_units[-1]['ordinal']+1): boundary_errors.append({'severity':'error','issue':'invalid_content_boundaries','content_start_unit':content_start,'backmatter_start_unit':backmatter_start})
+        validation,warnings=_validate_structure_tree(proposed,content_start,backmatter_start); validation=boundary_errors+validation
+        # A malformed proposal must never erase the accepted tree from the
+        # preceding round.  Keep the prior nodes and record the proposal as a
+        # rejected version for diagnostics.
+        accepted=bool(proposed and not validation)
+        if accepted:
+            db.execute('DELETE FROM structure_nodes WHERE run_id=?',(run['id'],)); ids={}
+            for ordinal,node in enumerate(sorted(proposed,key=lambda n:int(n['unit'])),1):
+                start=node['unit']; parent_id=ids.get(node.get('parent_start_unit')); ntype=node.get('node_type'); parsed=_chapter_number(node.get('title')) if ntype=='chapter' else (_part_number(node.get('title'))[0] if ntype=='part' and _part_number(node.get('title')) else None); number=node.get('number') if node.get('number') is not None else parsed; nsrc=node.get('number_source','printed' if number is not None else 'none')
+                cur=db.execute('INSERT INTO structure_nodes(run_id,ordinal,parent_id,node_type,title,number,number_source,source_derived,heading_level,start_unit,end_unit,confidence,evidence_json,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(run['id'],ordinal,parent_id,ntype,node.get('title'),number,nsrc,1,node.get('heading_level') or (1 if ntype in ('part','chapter') else 2),start,start,node.get('confidence'),json.dumps(node.get('evidence',{}),ensure_ascii=False),'needs_review')).lastrowid; ids[start]=cur
+            ordered=db.execute('SELECT id,start_unit FROM structure_nodes WHERE run_id=? ORDER BY start_unit,ordinal',(run['id'],)).fetchall()
+            for i,node in enumerate(ordered):
+                end=(ordered[i+1]['start_unit']-1) if i+1<len(ordered) else (backmatter_start-1 if backmatter_start else all_units[-1]['ordinal'])
+                db.execute('UPDATE structure_nodes SET end_unit=? WHERE id=?',(max(node['start_unit'],end),node['id']))
+            db.execute('UPDATE structure_runs SET content_start_unit=?,backmatter_start_unit=? WHERE id=?',(content_start,backmatter_start,run['id']))
+        current=_structure_snapshot(db,run['id'])
+        fp=hashlib.sha256(json.dumps(current,ensure_ascii=False,sort_keys=True).encode()).hexdigest(); unresolved=(result.get('unresolved') or [])+validation+warnings+reconcile_warnings; stable=accepted and fp==previous; quality=max(0,1-len(unresolved)/max(1,len(current)))
+        ver=db.execute('SELECT COALESCE(MAX(version),0)+1 FROM structure_versions WHERE run_id=?',(run['id'],)).fetchone()[0]
+        db.execute('INSERT INTO structure_versions(run_id,version,phase,tree_json,issues_json,fingerprint,quality_score,accepted,changes_json,created) VALUES(?,?,?,?,?,?,?,?,?,?)',(run['id'],ver,'agent_proposal',json.dumps(current,ensure_ascii=False),json.dumps(unresolved,ensure_ascii=False),fp,quality,1 if accepted else 0,json.dumps(result.get('changes') or [],ensure_ascii=False),now()))
+        hard_errors=[x for x in unresolved if isinstance(x,dict) and x.get('severity')=='error']
+        final=stable and accepted and not hard_errors; status=('completed_with_warnings' if final and unresolved else 'completed') if final else ('failed_validation' if round_no==max_rounds else 'needs_review')
+        db.execute('UPDATE structure_runs SET round=?,max_rounds=?,phase=?,fingerprint=?,quality_score=?,convergence=?,validation_issues_json=?,unresolved_json=?,last_repair_summary=?,status=?,completed=? WHERE id=?',(round_no,max_rounds,'completed' if final else 'refinement',fp,quality,1 if final else 0,json.dumps(unresolved,ensure_ascii=False),json.dumps(result.get('unresolved') or [],ensure_ascii=False),json.dumps(result.get('changes') or [],ensure_ascii=False),status,now() if status!='needs_review' else None,run['id']))
+        db.commit(); previous=fp; run=db.execute('SELECT * FROM structure_runs WHERE id=?',(run['id'],)).fetchone()
+        _progress('structure-refinement',round_no-1,max_rounds-1,f'round {round_no} · {"accepted" if accepted else "rejected"} · {len(unresolved)} issues'+(' (cached)' if hit else ''))
+        if final: break
+    db.close()
+
+def structure(project, model=None, reset=False, chunk_size=80, debug=False):
+    """Run candidate discovery once, then whole-tree refinement rounds."""
+    if reset: reset_stage(project,'structure')
+    probe=connect(project); prior=probe.execute('SELECT id FROM structure_runs ORDER BY generation DESC LIMIT 1').fetchone(); probe.close()
+    if not prior: structure_discovery(project,model=model,chunk_size=chunk_size,debug=debug)
+    structure_refinement(project,model=model,chunk_size=chunk_size,debug=debug)
 
 def build(project,out,reset=False):
-    db=connect(project); title=meta_get(db,'title','Scanned book'); lang=meta_get(db,'target_lang',meta_get(db,'source_lang','eng')); run=db.execute("SELECT id FROM assembly_runs WHERE status='approved' OR (status='needs_review' AND NOT EXISTS (SELECT 1 FROM manuscript_units u WHERE u.run_id=assembly_runs.id AND u.status!='approved')) ORDER BY generation DESC LIMIT 1").fetchone()
+    db=connect(project); lang=meta_get(db,'target_lang',meta_get(db,'source_lang','eng'))
+    assembly_check=db.execute('SELECT id,status FROM assembly_runs ORDER BY generation DESC LIMIT 1').fetchone()
+    if assembly_check and assembly_check['status']!='completed':
+        db.close(); raise RuntimeError(f'Build blocked: assembly validation status is {assembly_check["status"]}')
+    structure_check=db.execute('SELECT status,validation_issues_json,assembly_run_id,content_start_unit,backmatter_start_unit FROM structure_runs ORDER BY generation DESC LIMIT 1').fetchone()
+    if structure_check and structure_check['status'] not in ('completed','completed_with_warnings'):
+        db.close(); raise RuntimeError(f'Build blocked: structure status is {structure_check["status"]}')
+    if structure_check and assembly_check and structure_check['assembly_run_id'] != assembly_check['id']:
+        db.close(); raise RuntimeError('Build blocked: structure belongs to an older assembly; rerun structure')
+    if structure_check:
+        persisted=_structure_snapshot(db,db.execute('SELECT id FROM structure_runs ORDER BY generation DESC LIMIT 1').fetchone()['id'])
+        candidate=[dict(n,unit=n['start_unit']) for n in persisted]
+        hard,_warnings=_validate_structure_tree(candidate,structure_check['content_start_unit'],structure_check['backmatter_start_unit'])
+        if hard:
+            db.close(); raise RuntimeError(f'Build blocked: structure has {len(hard)} hard validation errors; rerun structure refinement')
+    title=meta_get(db,'title',None); author=meta_get(db,'author',None)
+    # Prefer explicit metadata, then recover a useful title/author from the
+    # first OCR page (common for scanned title pages).
+    first=db.execute('SELECT text,image FROM pages ORDER BY number LIMIT 1').fetchone()
+    if first and (not title or title in ('Scanned book', project.name)):
+        lines=[re.sub(r'\s+',' ',x).strip(' -–—') for x in (first['text'] or '').splitlines() if x.strip()]
+        author_end=0
+        if lines and not author:
+            author_parts=[]
+            for line in lines[:2]:
+                if line.isupper() and len(line)>2: author_parts.append(line)
+                else: break
+            if author_parts:
+                author=' '.join(author_parts).title(); author_end=len(author_parts)
+        upper=[x for x in lines[author_end:] if x.isupper() and len(x)>2]
+        if upper: title=' '.join(upper[:3]).title()
+    title=title or project.name.replace('-',' ').title(); author=author or 'Unknown author'
+    # Review is intentionally non-blocking: users can inspect the generated
+    # assembly without having to approve thousands of units one by one.  Build
+    # the latest assembly run using every non-discarded unit; approval remains
+    # available as metadata for future editorial workflows.
+    run=db.execute("SELECT id FROM assembly_runs ORDER BY generation DESC LIMIT 1").fetchone()
     if run:
-        rows=db.execute("SELECT kind,text,decisions_json FROM manuscript_units WHERE run_id=? AND status='approved' ORDER BY ordinal",(run['id'],)).fetchall(); body=''.join((f'<h{min(6,max(1,(json.loads(r["decisions_json"] or "{}").get("heading_level") or 2)))}>{html.escape(r["text"])}</h{min(6,max(1,(json.loads(r["decisions_json"] or "{}").get("heading_level") or 2)))}>' if r['kind'] in ('heading','subheading') else f'<blockquote>{html.escape(r["text"])}</blockquote>' if r['kind']=='blockquote' else f'<p>{html.escape(r["text"]).replace(chr(10)," ")}</p>') for r in rows)
+        rows=db.execute("SELECT ordinal,kind,text,decisions_json FROM manuscript_units WHERE run_id=? AND status!='discarded' ORDER BY ordinal",(run['id'],)).fetchall()
+        nodes=db.execute("SELECT id,parent_id,start_unit,title,number,number_source,heading_level,node_type FROM structure_nodes WHERE run_id=(SELECT id FROM structure_runs ORDER BY generation DESC LIMIT 1) AND start_unit>0 ORDER BY start_unit,ordinal",()).fetchall()
+        node_by_unit={n['start_unit']:n for n in nodes}
+        body_parts=[]
+        for r in rows:
+            text_value=html.escape(r['text'] or '').replace(chr(10),' '); node=node_by_unit.get(r['ordinal'])
+            if node:
+                # Structure controls hierarchy and navigation only.  The
+                # assembled/corrected unit remains the authoritative prose;
+                # never replace it with an LLM-normalized structure title.
+                level=min(6,max(1,int(node['heading_level'] or 2))); body_parts.append(f'<h{level} id="u{r["ordinal"]}">{text_value}</h{level}>')
+            elif r['kind']=='blockquote': body_parts.append(f'<blockquote id="u{r["ordinal"]}">{text_value}</blockquote>')
+            else: body_parts.append(f'<p id="u{r["ordinal"]}">{text_value}</p>')
+        body=''.join(body_parts)
+        toc_nodes=sorted(nodes,key=lambda n:n['start_unit'])
+        all_top_nodes=[n for n in toc_nodes if n['parent_id'] is None and n['node_type'] in ('part','chapter')]
+        content_start=int(structure_check['content_start_unit'] or (all_top_nodes[0]['start_unit'] if all_top_nodes else rows[0]['ordinal']))
+        backmatter_start=int(structure_check['backmatter_start_unit']) if structure_check['backmatter_start_unit'] else rows[-1]['ordinal']+1
+        top_nodes=[n for n in all_top_nodes if content_start<=n['start_unit']<backmatter_start]
+        file_for_unit={}; chapter_documents=[]; assigned={}
+        markup_by_unit={r['ordinal']:m for r,m in zip(rows,body_parts)}
+        def document(filename,doc_title,start,end):
+            ordinals=[r['ordinal'] for r in rows if start<=r['ordinal']<end]
+            for ordinal in ordinals:
+                if ordinal in assigned: raise RuntimeError(f'Build partition duplicates assembly unit {ordinal}')
+                assigned[ordinal]=filename; file_for_unit[ordinal]=filename
+            if ordinals: chapter_documents.append((filename,doc_title,''.join(markup_by_unit[x] for x in ordinals)))
+        if top_nodes:
+            document('frontmatter.xhtml','Front matter',rows[0]['ordinal'],content_start)
+            boundaries=[(n['start_unit'],top_nodes[i+1]['start_unit'] if i+1<len(top_nodes) else backmatter_start,i+1,n) for i,n in enumerate(top_nodes)]
+            for start,end,idx,node in boundaries:
+                stem='part' if node['node_type']=='part' else 'chapter'
+                fallback=(f'Part {node["number"]}' if node['node_type']=='part' else (f'Chapitre {node["number"]}' if str(lang).startswith('fra') else f'Chapter {node["number"]}'))
+                document(f'{stem}-{idx:03d}.xhtml',node['title'] or fallback,start,min(end,backmatter_start))
+            document('backmatter.xhtml','Back matter',backmatter_start,rows[-1]['ordinal']+1)
+            expected={r['ordinal'] for r in rows}
+            if set(assigned)!=expected:
+                missing=sorted(expected-set(assigned)); raise RuntimeError(f'Build partition omits assembly units {missing[:20]}')
+        else:
+            chapter_documents=[('chapter-001.xhtml',title,body)]
+            file_for_unit={r['ordinal']:'chapter-001.xhtml' for r in rows}
+        def link(n):
+            prefix=('Part ' if n['node_type']=='part' else 'Chapter ') if n['number'] is not None else ''
+            bare=not n['title'] or bool(re.fullmatch(r'\s*(?:chapter|chapitre)?\s*\d+[.)]?\s*',n['title'] or '',re.I))
+            already_numbered=(_chapter_number(n['title']) is not None if n['node_type']=='chapter' else _part_number(n['title']) is not None)
+            label=(f'Chapitre {n["number"]}' if bare and str(lang).startswith('fra') else f'Chapter {n["number"]}') if bare else (n['title'] if already_numbered else (f'{prefix}{n["number"]} — {n["title"]}' if n['number'] is not None else n['title']))
+            return f'<li><a href="{file_for_unit.get(n["start_unit"],"chapter-001.xhtml")}#u{n["start_unit"]}">{html.escape(label)}</a></li>'
+        visible=[n for n in toc_nodes if content_start<=n['start_unit']<backmatter_start]
+        toc_parts=[]
+        if any(r['ordinal']<content_start for r in rows): toc_parts.append('<li><a href="frontmatter.xhtml">Front matter</a></li>')
+        for n in visible:
+            if n['node_type'] in ('part','chapter') and n['parent_id'] is None:
+                children=[x for x in visible if x['parent_id']==n['id']]
+                # Parts and chapters are siblings; only sections are nested.
+                children=[x for x in children if x['node_type'] in ('section','subsection')]
+                toc_parts.append(link(n)[:-5]+(('<ul>'+''.join(link(x) for x in children)+'</ul>') if children else '')+'</li>')
+        if any(r['ordinal']>=backmatter_start for r in rows): toc_parts.append('<li><a href="backmatter.xhtml">Back matter</a></li>')
+        toc=''.join(toc_parts)
     else:
-        rows=db.execute("SELECT b.approved_text,b.corrected_text,b.translation FROM blocks b WHERE b.status='approved' ORDER BY b.page_id,b.ordinal").fetchall(); body=''.join(f'<p>{html.escape((r["translation"] or r["corrected_text"] or r["approved_text"] or "").replace(chr(10)," "))}</p>' for r in rows)
+        rows=db.execute("SELECT b.approved_text,b.corrected_text,b.text,b.translation FROM blocks b ORDER BY b.page_id,b.ordinal").fetchall(); body=''.join(f'<p>{html.escape((r["translation"] or r["corrected_text"] or r["approved_text"] or r["text"] or "").replace(chr(10)," "))}</p>' for r in rows)
+        toc=''
+    toc_markup = toc or '<li><a href="chapter-001.xhtml">Text</a></li>'
+    if not run:
+        chapter_documents=[('chapter-001.xhtml',title,body)]
+    chapter_documents=chapter_documents or [('chapter-001.xhtml',title,body)]
+    cover_path=(project/first['image']) if first and first['image'] else None
+    if cover_path and cover_path.is_file():
+        cover_ext=cover_path.suffix.lower()
+        cover_media={'jpg':'image/jpeg','jpeg':'image/jpeg','png':'image/png','webp':'image/webp'}.get(cover_ext.lstrip('.'))
+    else:
+        cover_path=None; cover_ext=''; cover_media=None
+    cover_name='cover'+cover_ext if cover_path and cover_media else None
+    cover_manifest=(f'<item id="cover-image" href="images/{cover_name}" media-type="{cover_media}" properties="cover-image"/>'
+                    '<item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>') if cover_name else ''
+    cover_metadata='<meta name="cover" content="cover-image"/>' if cover_name else ''
+    cover_spine='<itemref idref="cover" linear="yes"/>' if cover_name else ''
     with zipfile.ZipFile(out,'w') as z:
-        z.writestr('mimetype',b'application/epub+zip',compress_type=zipfile.ZIP_STORED); z.writestr('META-INF/container.xml','<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/package.opf" media-type="application/oebps-package+xml"/></rootfiles></container>'); z.writestr('OEBPS/style.css','body{font-family:serif;line-height:1.5;margin:6%;}p{text-align:justify;}'); z.writestr('OEBPS/chapter-001.xhtml',f'<html xmlns="http://www.w3.org/1999/xhtml" lang="{html.escape(lang)}"><head><title>{html.escape(title)}</title><link rel="stylesheet" href="style.css"/></head><body><h1>{html.escape(title)}</h1>{body}</body></html>'); z.writestr('OEBPS/nav.xhtml','<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc"><ol><li><a href="chapter-001.xhtml">Text</a></li></ol></nav></body></html>'); z.writestr('OEBPS/package.opf',f'<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">urn:uuid:{uuid.uuid4()}</dc:identifier><dc:title>{html.escape(title)}</dc:title><dc:language>{html.escape(lang)}</dc:language></metadata><manifest><item id="c" href="chapter-001.xhtml" media-type="application/xhtml+xml"/><item id="n" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="s" href="style.css" media-type="text/css"/></manifest><spine><itemref idref="c"/></spine></package>')
+        container = ('<?xml version="1.0" encoding="UTF-8"?>'
+                     '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                     '<rootfiles><rootfile full-path="OEBPS/package.opf" '
+                     'media-type="application/oebps-package+xml"/></rootfiles></container>')
+        z.writestr('mimetype',b'application/epub+zip',compress_type=zipfile.ZIP_STORED)
+        z.writestr('META-INF/container.xml',container)
+        z.writestr('OEBPS/style.css','body{font-family:serif;line-height:1.5;margin:6%;}p{text-align:justify;}')
+        if cover_name:
+            z.writestr(f'OEBPS/images/{cover_name}',cover_path.read_bytes())
+            z.writestr('OEBPS/cover.xhtml',f'<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="{html.escape(lang)}"><head><title>Cover</title><meta name="viewport" content="width=device-width,height=device-height"/><style>html,body{{margin:0;padding:0;width:100%;height:100%;}}body{{display:flex;align-items:center;justify-content:center;}}img{{display:block;max-width:100%;max-height:100%;object-fit:contain;}}</style></head><body epub:type="cover"><img src="images/{cover_name}" alt="Cover of {html.escape(title)}"/></body></html>')
+        for filename, doc_title, doc_body in chapter_documents:
+            lead = f'<h1>{html.escape(title)}</h1><p class="author">{html.escape(author)}</p>' if filename == chapter_documents[0][0] else ''
+            z.writestr(f'OEBPS/{filename}',f'<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml" lang="{html.escape(lang)}"><head><title>{html.escape(doc_title)}</title><link rel="stylesheet" href="style.css"/></head><body>{lead}{doc_body}</body></html>')
+        z.writestr('OEBPS/nav.xhtml',f'<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Contents</title></head><body><nav epub:type="toc" id="toc"><ol>{toc_markup}</ol></nav></body></html>')
+        manifest=''.join(f'<item id="c{i}" href="{html.escape(fn)}" media-type="application/xhtml+xml"/>' for i,(fn,_,_) in enumerate(chapter_documents))
+        spine=''.join(f'<itemref idref="c{i}"/>' for i in range(len(chapter_documents)))
+        z.writestr('OEBPS/package.opf',f'<?xml version="1.0" encoding="UTF-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">urn:uuid:{uuid.uuid4()}</dc:identifier><dc:title>{html.escape(title)}</dc:title><dc:creator>{html.escape(author)}</dc:creator><dc:language>{html.escape(lang)}</dc:language>{cover_metadata}</metadata><manifest>{manifest}<item id="n" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="s" href="style.css" media-type="text/css"/>{cover_manifest}</manifest><spine>{cover_spine}{spine}</spine></package>')
     db.close()
     print(f'[build] wrote {out}', flush=True)
