@@ -8,6 +8,13 @@ from .translation import set_retry_hook
 
 STAGES=('ocr','correction','assembly','structure-discovery','structure-refinement','translation','build')
 DEPS={'ocr':None,'correction':'ocr','assembly':'correction','structure-discovery':'assembly','structure-refinement':'structure-discovery','translation':'structure-refinement','build':'structure-refinement'}
+
+def _refinement_display(run, status, done, total):
+    """Return truthful dashboard progress for an authoritative TOC run."""
+    if (run and run['phase'] == 'toc_authoritative'
+            and run['status'] in ('completed', 'completed_with_warnings')):
+        return 'completed', 1, 1, 'Not required: authoritative TOC accepted', True
+    return status, done, total, None, False
 _CANCEL_EVENTS={}
 
 UI='''<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>book2epub dashboard</title><style>:root{color-scheme:light}body{font:14px system-ui,-apple-system,sans-serif;margin:0;background:#f4f6fa;color:#172033}header{padding:24px 5%;background:#172033;color:white}main{max-width:1200px;margin:24px auto;padding:0 20px}.summary,.card{background:white;border-radius:12px;padding:18px;box-shadow:0 2px 10px #17203312;margin-bottom:16px}.totals{display:flex;gap:24px;flex-wrap:wrap}.metric{min-width:130px}.metric b{display:block;font-size:20px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:14px}.card h2{margin:0 0 8px;text-transform:capitalize}.state{font-weight:600}.bar{height:9px;background:#e5e9f2;border-radius:8px;overflow:hidden}.bar i{display:block;height:100%;background:#4969d8}.muted{color:#667085}.err{color:#b42318;background:#fff1f0;padding:8px;border-radius:6px;margin-top:8px;white-space:pre-wrap}.actions{margin-top:12px}button,a{margin-right:8px;padding:7px 10px;border:0;border-radius:6px;background:#e8edf8;color:#172033;text-decoration:none;cursor:pointer}button.primary{background:#4969d8;color:#fff}button:disabled{opacity:.45;cursor:not-allowed}pre{white-space:pre-wrap}</style><header><h1>book2epub pipeline</h1><div id="summary">Loading…</div></header><main><div class="summary"><h2>Overall usage</h2><div id="totals" class="totals"></div></div><nav class="summary"><a href="/ocr">OCR</a><a href="/correction">Correction</a><a href="/assembly">Assembly</a><a href="/structure">Structure</a><a href="/translation">Translation</a><a href="/costs">Costs/logs</a></nav><div id="stages" class="cards"></div><div id="warning"></div></main><script>const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));async function run(stage,reset){if(reset&&!confirm('Reset '+stage+'? This deletes derived '+stage+' results.'))return;let r=await fetch('/api/stages/'+stage+'/'+(reset?'reset':'run'),{method:'POST'});let x=await r.json();if(!r.ok)alert((x.reason||'Stage could not be started')+(x.blocked_by?' — blocked by '+x.blocked_by:''));load()}function metrics(m){let c=Object.entries(m.costs||{}).map(([k,v])=>esc(k)+' '+Number(v).toFixed(4)).join(', ')||'—';return '<div class="muted">input '+m.input_tokens+' · cached '+m.cached_input_tokens+' · output '+m.output_tokens+' · total '+m.total_tokens+'<br>cost '+c+' · requests '+m.requests+' · retries '+m.retries+' · failures '+m.failures+'</div>'}async function load(){try{let x=await(await fetch('/api/pipeline/status')).json();document.getElementById('summary').innerHTML='<b>'+esc(x.source_lang||'?')+' → '+esc(x.target_lang||'source build')+'</b> · '+esc(x.source||'');let t=x.overall;document.getElementById('totals').innerHTML='<div class="metric"><span>Tokens</span><b>'+t.total_tokens+'</b></div><div class="metric"><span>Input / cached / output</span><b>'+t.input_tokens+' / '+t.cached_input_tokens+' / '+t.output_tokens+'</b></div><div class="metric"><span>Cost</span><b>'+Object.entries(t.costs||{}).map(([k,v])=>esc(k)+' '+Number(v).toFixed(4)).join(', ')||'—'+'</b></div><div class="metric"><span>LLM requests</span><b>'+t.requests+' · retries '+t.retries+' · failures '+t.failures+'</b></div>';document.getElementById('stages').innerHTML=x.stages.map(s=>{let pct=s.total?Math.min(100,100*s.completed/s.total):0;return '<section class="card"><h2>'+esc(s.name)+'</h2><div class="state">'+esc(s.status)+(s.blocked_by?' · blocked by '+esc(s.blocked_by):'')+'</div><p><b>'+s.completed+' of '+(s.total||'?')+' '+esc(s.unit||'items')+'</b> · '+pct.toFixed(0)+'%</p><div class="bar"><i style="width:'+pct+'%"></i></div>'+metrics(s.metrics)+(s.current?'<p class="muted">'+esc(s.current)+'</p>':'')+(s.error?'<div class="err">'+esc(s.error)+'</div>':'')+'<div class="actions"><button class="primary" '+(!s.runnable?'disabled':'')+' onclick="run(\''+s.name+'\',false)">Run / Resume</button><button onclick="run(\''+s.name+'\',true)">Reset</button><a href="/'+s.name+'">Inspect</a></div></section>'}).join('')}catch(e){document.getElementById('warning').innerHTML='<div class="err">Could not load live status: '+esc(e)+'</div>'}}load();setInterval(load,1500)</script>'''
@@ -19,6 +26,7 @@ ASSEMBLY_UI='''<!doctype html><meta charset="utf-8"><title>Assembly inspection</
 STRUCTURE_UI='''<!doctype html><meta charset="utf-8"><title>Structure inspection</title><style>body{font:14px system-ui;margin:24px}li{margin:8px}.meta{color:#666}.versions{display:grid;gap:8px;margin:16px 0}.version{padding:8px;border:1px solid #ddd;border-radius:6px}.accepted{border-color:#287a45;background:#f2fff6}.rejected{border-color:#b54708;background:#fff8f0}pre{white-space:pre-wrap}</style><p><a href="/">← dashboard</a></p><h2>Structure inspection (read-only)</h2><div id="meta"></div><div id="versions" class="versions"></div><div id="tree"></div><pre id="evidence"></pre><script>async function load(){let x=await (await fetch('/api/structure/tree')).json();meta.textContent=x.run?('Generation '+x.run.generation+' · round '+(x.run.round||0)+'/'+(x.run.max_rounds||5)+' · '+x.run.status+' · phase '+(x.run.phase||'?')+' · '+(x.run.convergence?'converged':'refining')+' · '+x.nodes.length+' nodes · main '+(x.run.content_start_unit||'?')+' · back '+(x.run.backmatter_start_unit||'?')):'No structure run';versions.innerHTML=x.versions.map(v=>'<div class="version '+(v.accepted?'accepted':'rejected')+'"><b>Round/version '+v.version+' · '+v.phase+' · '+(v.accepted?'accepted':'rejected/inspection')+'</b> · score '+Number(v.quality_score||0).toFixed(3)+'<br><span class="meta">issues '+escJson(v.issues_json)+' · changes '+escJson(v.changes_json)+'</span></div>').join('');let children=(pid)=>x.nodes.filter(n=>(n.parent_id||null)===(pid||null));let render=(pid)=>children(pid).map(n=>'<li><button onclick="show('+n.id+')">'+n.node_type+': '+displayTitle(n)+'</button> <span class="meta">units '+n.start_unit+'–'+(n.end_unit||'?')+' · number '+(n.number??'—')+' ('+(n.number_source||'none')+') · confidence '+(n.confidence||'')+' · '+(n.source_derived?'source':'synthetic')+(n.status==='needs_review'?' · review':'')+'</span>'+((children(n.id).length)?'<ul>'+render(n.id)+'</ul>':'')+'</li>').join('');tree.innerHTML='<ul>'+render(null)+'</ul>';window.nodes=x.nodes}function displayTitle(n){let t=n.title||('[untitled '+(n.number||'')+']');if(n.number!=null&&!/^\\s*(?:chapter|chapitre)?\\s*\\d+[.)]?\\s/i.test(t))t=n.number+'. '+t;return t}function escJson(s){try{return JSON.stringify(JSON.parse(s||'[]'))}catch(e){return s||'[]'}}function show(id){let n=nodes.find(x=>x.id===id);evidence.textContent=JSON.stringify(n,null,2)}load()</script>'''
 
 UI=UI.replace("onclick=\"run(''+s.name+'',false)\"", "onclick=\"run(&quot;'+s.name+'&quot;,false)\"").replace("onclick=\"run(''+s.name+'',true)\"", "onclick=\"run(&quot;'+s.name+'&quot;,true)\"")
+UI=UI.replace("+(s.current?'<p class=\"muted\">'+esc(s.current)+'</p>':'')", "+(s.current?'<p class=\"muted\">'+esc(s.current)+'</p>':'')+(s.output_path?'<p class=\"muted\"><b>Output:</b> <a href=\"'+esc(s.output_url||'')+'\" download>'+esc(s.output_path)+'</a></p>':'')")
 UI=UI.replace("'<div class=\"state\">'+esc(s.status)+(s.blocked_by?' · blocked by '+esc(s.blocked_by):'')+'</div>'", "'<div class=\"state\">'+esc(s.status)+(s.name.startsWith('structure-')&&s.round?' · round '+s.round+'/'+(s.max_rounds||5)+' · '+esc(s.phase||'')+(s.convergence?' · converged':' · '+s.validation_issue_count+' issues'):'')+(s.blocked_by?' · blocked by '+esc(s.blocked_by):'')+'</div>'")
 UI=UI.replace('function metrics(m)', 'async function stop(stage){if(!confirm("Stop "+stage+"?"))return;let r=await fetch("/api/stages/"+stage+"/stop",{method:"POST"});let x=await r.json();if(!r.ok||x.ok===false)alert(x.reason||"Stage could not be stopped");load()}function metrics(m)')
 UI=UI.replace("+'%</p>", "+'% · ETA '+(s.eta_seconds==null?(s.status==='running'?'calculating…':'—'):Math.ceil(s.eta_seconds/60)+' min')+'</p>")
@@ -72,10 +80,12 @@ def serve(project: Path, host='127.0.0.1', port=8765):
             # Chunk counts alone may be partial, cached, or from an older key
             # version and must not determine dependency readiness.
             complete=(c.execute("SELECT 1 FROM structure_versions WHERE run_id=? AND phase='discovery' LIMIT 1",(run['id'],)).fetchone() if run else None)
+            toc_complete=(c.execute("SELECT 1 FROM structure_runs WHERE id=? AND phase='toc_authoritative' AND status IN ('completed','completed_with_warnings')",(run['id'],)).fetchone() if run else None)
+            if toc_complete: return ('completed',1,1)
             total=done if complete else max(done,1)
             return ('completed' if complete else ('running' if done else 'not_started'),done,total)
         elif stage=='structure-refinement':
-            run=c.execute('SELECT * FROM structure_runs ORDER BY generation DESC LIMIT 1').fetchone(); total=max(1,(run['max_rounds'] or 5)-1) if run else 4; done=max(0,(run['round'] or 1)-1) if run else 0
+            run=c.execute('SELECT * FROM structure_runs ORDER BY generation DESC LIMIT 1').fetchone(); total=max(1,(run['max_rounds'] or 10)-1) if run else 9; done=max(0,(run['round'] or 1)-1) if run else 0
             if run and run['status']=='failed_validation': return ('failed_validation',done,total)
             if run and run['status'] in ('completed','completed_with_warnings'): return (run['status'],done,total)
         elif stage=='translation': total=c.execute('SELECT COUNT(*) FROM blocks').fetchone()[0]; done=c.execute('SELECT COUNT(*) FROM blocks WHERE translation IS NOT NULL').fetchone()[0]
@@ -90,11 +100,16 @@ def serve(project: Path, host='127.0.0.1', port=8765):
     def usage_summary(c, stage=None):
         if stage=='structure-discovery':
             where="WHERE (stage=? OR (stage='structure' AND run_id LIKE 'structure-%'))"; args=(stage,)
+        elif stage=='assembly':
+            # Boundary-classifier requests are part of Assembly even though
+            # they retain their own ledger label for auditability.
+            where="WHERE stage IN ('assembly','assembly-join')"; args=()
         else:
             where='WHERE stage=?' if stage else ''; args=(stage,) if stage else ()
         rows=c.execute(f'SELECT COALESCE(SUM(input_tokens),0) i,COALESCE(SUM(cached_input_tokens),0) ci,COALESCE(SUM(output_tokens),0) o,COALESCE(SUM(total_cost),0) cost,COUNT(*) requests FROM usage_events {where}',args).fetchone()
-        failures=c.execute(f"SELECT COALESCE(SUM(failed_attempts),0) FROM stage_jobs {'WHERE stage=?' if stage else ''}",args).fetchone()[0]
-        retries=c.execute(f'SELECT COALESCE(SUM(retry_count),0) FROM stage_jobs {"WHERE stage=?" if stage else ""}',args).fetchone()[0]
+        job_args=(stage,) if stage else ()
+        failures=c.execute(f"SELECT COALESCE(SUM(failed_attempts),0) FROM stage_jobs {'WHERE stage=?' if stage else ''}",job_args).fetchone()[0]
+        retries=c.execute(f'SELECT COALESCE(SUM(retry_count),0) FROM stage_jobs {"WHERE stage=?" if stage else ""}',job_args).fetchone()[0]
         costs={r['currency'] or 'USD':r['cost'] for r in c.execute(f'SELECT COALESCE(currency,\'USD\') currency,COALESCE(SUM(total_cost),0) cost FROM usage_events {where} GROUP BY currency',args)}
         d={'input_tokens':rows['i'],'cached_input_tokens':rows['ci'],'output_tokens':rows['o'],'total_tokens':rows['i']+rows['o'],'costs':costs,'requests':rows['requests'],'retries':retries,'failures':failures}; return d
     def run_stage(job_id,stage,reset=False):
@@ -131,7 +146,11 @@ def serve(project: Path, host='127.0.0.1', port=8765):
             elif intervals: eta=(sum(intervals)/len(intervals))*remaining
             c.execute('UPDATE stage_jobs SET current=?,completed=?,total=?,log=?,updated=?,last_progress_at=?,timing_samples_json=?,uncached_total=?,uncached_completed=?,eta_seconds=? WHERE id=?',(detail,current,total,out.getvalue(),now_t,last,_json.dumps(samples),uncached_total,uncached_completed,eta,job_id)); c.commit(); c.close()
         def retry(kind,attempt,max_attempts,detail):
-            c=connect(project); c.execute('UPDATE stage_jobs SET retry_count=retry_count+?,failed_attempts=failed_attempts+?,updated=? WHERE id=?',(1 if kind=='failure' and attempt>1 else 0,1 if kind=='failure' else 0,time.time(),job_id)); c.commit(); c.close()
+            c=connect(project)
+            row=c.execute('SELECT current FROM stage_jobs WHERE id=?',(job_id,)).fetchone()
+            current=re.sub(r' · attempt \d+/\d+ failed: .*$', '',(row['current'] or 'model request'))
+            if kind=='failure': current+=f' · attempt {attempt}/{max_attempts} failed: {detail}'
+            c.execute('UPDATE stage_jobs SET current=?,retry_count=retry_count+?,failed_attempts=failed_attempts+?,updated=? WHERE id=?',(current,1 if kind=='failure' and attempt>1 else 0,1 if kind=='failure' else 0,time.time(),job_id)); c.commit(); c.close()
         try:
             c=connect(project)
             # Reset is itself asynchronous and can take time to remove
@@ -206,10 +225,13 @@ def serve(project: Path, host='127.0.0.1', port=8765):
                         self.send_response(503); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(json.dumps({'error':'database_busy','retry_after':1}).encode()); return
                     raise
                 active=c.execute("SELECT * FROM stage_jobs WHERE status IN ('queued','running','stopping','resetting') ORDER BY id DESC LIMIT 1").fetchone(); result=[]
-                units={'ocr':'pages','correction':'pages','assembly':'windows','structure-discovery':'chunks','structure-refinement':'rounds','translation':'blocks','build':'artifacts'}
+                units={'ocr':'pages','correction':'pages','assembly':'windows','structure-discovery':'chunks','structure-refinement':'steps','translation':'blocks','build':'artifacts'}
                 for stage in STAGES:
                     status,done,total=stage_status(c,stage); blocked=DEPS[stage] and stage_status(c,DEPS[stage])[0]!='completed'; job=c.execute('SELECT * FROM stage_jobs WHERE stage=? ORDER BY id DESC LIMIT 1',(stage,)).fetchone()
                     structure_run=c.execute('SELECT * FROM structure_runs ORDER BY generation DESC LIMIT 1').fetchone() if stage.startswith('structure-') else None
+                    not_required=False; display_current=None
+                    if stage=='structure-refinement':
+                        status,done,total,display_current,not_required=_refinement_display(structure_run,status,done,total)
                     if job:
                         if job['status'] in ('queued','running','stopping','resetting','failed','stopped'): status=job['status']
                         elif job['status']=='reset_complete': status='not_started'
@@ -220,7 +242,8 @@ def serve(project: Path, host='127.0.0.1', port=8765):
                     if job and done and total and done<total: eta=max(0,elapsed/done*(total-done))
                     workers=(int(os.environ.get('BOOK2EPUB_CORRECTION_WORKERS','3')) if stage=='correction' else int(os.environ.get('BOOK2EPUB_ASSEMBLY_WORKERS','2')) if stage=='assembly' else 1)
                     timing_count=max(0,len(_json.loads(job['timing_samples_json'] or '[]'))-1) if job and 'timing_samples_json' in job.keys() and job['timing_samples_json'] else 0
-                    result.append({'name':stage,'status':'blocked' if blocked and status=='not_started' else status,'completed':done,'total':total,'unit':units[stage],'workers':max(1,min(3,workers)),'current':job['current'] if job else None,'elapsed_seconds':round(elapsed,1),'eta_seconds':round(job['eta_seconds'],1) if job and job['eta_seconds'] is not None else None,'uncached_total':job['uncached_total'] if job and 'uncached_total' in job.keys() else None,'uncached_completed':job['uncached_completed'] if job and 'uncached_completed' in job.keys() else None,'timing_sample_count':timing_count,'round':structure_run['round'] if structure_run else None,'max_rounds':structure_run['max_rounds'] if structure_run else None,'phase':structure_run['phase'] if structure_run and 'phase' in structure_run.keys() else None,'convergence':bool(structure_run['convergence']) if structure_run and 'convergence' in structure_run.keys() else False,'validation_issue_count':len(_json.loads(structure_run['validation_issues_json'] or '[]')) if structure_run and 'validation_issues_json' in structure_run.keys() else 0,'runnable':not blocked and not active,'blocked_by':DEPS[stage] if blocked else None,'error':job['error'] if job else None,'retry_count':job['retry_count'] if job and 'retry_count' in job.keys() else 0,'metrics':usage_summary(c,stage)})
+                    artifact=(project/'book.epub') if stage=='build' and (project/'book.epub').exists() else None
+                    result.append({'name':stage,'status':'blocked' if blocked and status=='not_started' else status,'completed':done,'total':total,'unit':units[stage],'workers':max(1,min(3,workers)),'current':display_current or (job['current'] if job else None),'not_required':not_required,'output_path':str(artifact) if artifact else None,'output_url':'/files/book.epub' if artifact else None,'elapsed_seconds':round(elapsed,1),'eta_seconds':round(job['eta_seconds'],1) if job and job['eta_seconds'] is not None else None,'uncached_total':job['uncached_total'] if job and 'uncached_total' in job.keys() else None,'uncached_completed':job['uncached_completed'] if job and 'uncached_completed' in job.keys() else None,'timing_sample_count':timing_count,'round':structure_run['round'] if structure_run else None,'max_rounds':structure_run['max_rounds'] if structure_run else None,'phase':structure_run['phase'] if structure_run and 'phase' in structure_run.keys() else None,'convergence':bool(structure_run['convergence']) if structure_run and 'convergence' in structure_run.keys() else False,'validation_issue_count':len(_json.loads(structure_run['validation_issues_json'] or '[]')) if structure_run and 'validation_issues_json' in structure_run.keys() else 0,'runnable':not blocked and not active,'blocked_by':DEPS[stage] if blocked else None,'error':job['error'] if job else None,'retry_count':job['retry_count'] if job and 'retry_count' in job.keys() else 0,'metrics':usage_summary(c,stage)})
                 return self._json({'source':str(project/'source.pdf'),'source_lang':meta(c,'source_lang'),'target_lang':meta(c,'target_lang'),'stages':result,'overall':usage_summary(c),'active':dict(active) if active else None})
             if self.path.startswith('/api/jobs/'):
                 jid=int(self.path.rsplit('/',1)[1]); j=db.execute('SELECT * FROM stage_jobs WHERE id=?',(jid,)).fetchone(); return self._json(dict(j) if j else {})
@@ -262,6 +285,15 @@ def serve(project: Path, host='127.0.0.1', port=8765):
             if m:
                 stage,action=m.groups()
                 if stage not in STAGES:return self.send_error(404)
+                if action=='reset':
+                    # Reset is intentionally a non-running operation.  This
+                    # prevents a dashboard click from both deleting derived
+                    # output and silently launching a new paid LLM run.
+                    active=db.execute("SELECT id FROM stage_jobs WHERE status IN ('queued','running','stopping','resetting') LIMIT 1").fetchone()
+                    if active:
+                        self.send_response(409); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(json.dumps({'ok':False,'reason':'stop the active stage before resetting'}).encode()); return
+                    reset_stage(project,stage,project/'book.epub')
+                    return self._json({'ok':True,'reset':True,'job_id':None})
                 jid,err=launch(stage,action=='reset')
                 if err:
                     self.send_response(409); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(json.dumps({'ok':False,'reason':err[0],'blocked_by':err[1]}).encode()); return

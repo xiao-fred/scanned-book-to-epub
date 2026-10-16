@@ -101,7 +101,7 @@ def load_dotenv(*paths):
             if len(value)>=2 and value[0]==value[-1] and value[0] in "'\"": value=value[1:-1]
             if key and key not in os.environ: os.environ[key]=value
 
-def translate_segment(text, source, target, provider='mock', env_file=None, image_path=None, system_prompt=None, model=None):
+def translate_segment(text, source, target, provider='mock', env_file=None, image_path=None, system_prompt=None, model=None, max_attempts=None):
     """Run one correction, translation, or assembly LLM operation.
 
     All hosted operations use the same serialized request/retry/logging path.
@@ -115,10 +115,14 @@ def translate_segment(text, source, target, provider='mock', env_file=None, imag
     # Efficiency Center coding clients are restricted to Responses/Messages.
     if 'coding.efficient.center' in url and url.rstrip('/').endswith('/chat/completions'):
         url=url.rsplit('/chat/completions',1)[0]+'/responses'
+    image_paths=list(image_path) if isinstance(image_path,(list,tuple)) else ([image_path] if image_path else [])
+    image_paths=[Path(path) for path in image_paths if path and Path(path).is_file()]
     user_content=text
-    if image_path and Path(image_path).is_file():
-        data=base64.b64encode(Path(image_path).read_bytes()).decode(); mime='image/jpeg' if str(image_path).lower().endswith(('.jpg','.jpeg')) else 'image/png'
-        user_content=[{'type':'text','text':text},{'type':'image_url','image_url':{'url':f'data:{mime};base64,{data}'}}]
+    if image_paths:
+        user_content=[{'type':'text','text':text}]
+        for path in image_paths:
+            data=base64.b64encode(path.read_bytes()).decode(); mime='image/jpeg' if str(path).lower().endswith(('.jpg','.jpeg')) else 'image/png'
+            user_content.append({'type':'image_url','image_url':{'url':f'data:{mime};base64,{data}'}})
     chosen_model=model or os.environ.get('BOOK2EPUB_TRANSLATION_MODEL')
     if not chosen_model:
         raise RuntimeError('Set BOOK2EPUB_TRANSLATION_MODEL in the project .env or pass an explicit model')
@@ -127,7 +131,8 @@ def translate_segment(text, source, target, provider='mock', env_file=None, imag
         system=system_prompt or f'Translate faithfully from {source} to {target}. Preserve formatting.'
         user=[]
         if isinstance(user_content,list):
-            user=[{'type':'input_text','text':user_content[0]['text']},{'type':'input_image','image_url':user_content[1]['image_url']['url']}]
+            user=[{'type':'input_text','text':user_content[0]['text']}]
+            user.extend({'type':'input_image','image_url':item['image_url']['url']} for item in user_content[1:])
         else: user=[{'type':'input_text','text':user_content}]
         payload={'model':chosen_model,'input':[{'role':'system','content':[{'type':'input_text','text':system}]},{'role':'user','content':user}]}
     else:
@@ -138,9 +143,10 @@ def translate_segment(text, source, target, provider='mock', env_file=None, imag
     log_entry={'timestamp':time.time(),'provider':provider,'url':url,'model':chosen_model,
                'source':source,'target':target,'input_text':text,
                'system_prompt':system_prompt or f'Translate faithfully from {source} to {target}. Preserve formatting.',
-               'image_path':str(image_path) if image_path else None,
-               'image_attached':bool(image_path and Path(image_path).is_file())}
-    max_attempts, retry_delay = _retry_settings()
+               'image_path':([str(path) for path in image_paths] if len(image_paths)>1 else (str(image_paths[0]) if image_paths else None)),
+               'image_attached':bool(image_paths)}
+    configured_attempts, retry_delay = _retry_settings()
+    max_attempts = configured_attempts if max_attempts is None else max(1, int(max_attempts))
     successful_attempt_log = None
     for attempt in range(1, max_attempts + 1):
         attempt_log = dict(log_entry, attempt=attempt, max_attempts=max_attempts,

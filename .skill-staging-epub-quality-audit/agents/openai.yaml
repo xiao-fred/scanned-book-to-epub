@@ -1,0 +1,7 @@
+interface:
+  display_name: "EPUB Quality Audit"
+  short_description: "Find content and package defects in EPUBs"
+  default_prompt: "Use $epub-quality-audit to inspect this EPUB for missing, duplicated, truncated, reordered, structural, and packaging problems."
+policy:
+  allow_implicit_invocation: true
+

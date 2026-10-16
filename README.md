@@ -96,6 +96,17 @@ The default assembly window is six pages with a one-page overlap; configure it
 with `BOOK2EPUB_ASSEMBLY_WINDOW_SIZE` or override it per CLI run with
 `--window-size N`. Values around four to six balance context, quality, and
 request time.
+Assembly keeps corrected blocks as the authoritative source text; only a
+deterministic boundary join may add a separating space or remove a line-wrap
+hyphen. In `hybrid` join mode, the LLM is used only for ambiguous paragraph
+boundaries across page breaks and may return only `join`/`split` decisions; it
+cannot rewrite manuscript text. Configure
+`BOOK2EPUB_ASSEMBLY_JOIN_MODE`, `BOOK2EPUB_ASSEMBLY_JOIN_MODEL`, and
+`BOOK2EPUB_ASSEMBLY_JOIN_CONFIDENCE`. `heuristic`, `hybrid`, and `llm` modes
+are supported. Invalid or low-confidence answers use the deterministic
+heuristic unless `BOOK2EPUB_ASSEMBLY_JOIN_FALLBACK=fail`. Set
+`BOOK2EPUB_ASSEMBLY_JOIN_IMAGES=true` only when page-image evidence is worth
+one request per boundary; the default keeps decisions text-only and batched.
 Review assembled units at `http://127.0.0.1:8765/assembly`, then approve them
 before building the EPUB.
 
@@ -103,12 +114,22 @@ Correction also classifies semantic formatting (headings, quotes, captions,
 footnotes, lists, tables, and page furniture). Assembled body paragraphs over
 200 words are split at sentence boundaries; override this with
 `BOOK2EPUB_ASSEMBLY_MAX_WORDS` in the root `.env`.
-Structure performs chunked discovery once, then uses an agentic whole-tree
-refinement loop. On each refinement round the agent may request focused unit
-evidence or submit a complete revised hierarchy and front/main/back boundaries;
-invalid proposals are rejected without replacing the accepted tree. Five total
-rounds are the default; tune `BOOK2EPUB_STRUCTURE_MAX_ROUNDS` up to a hard limit
-of ten.
+OCR renders every page and extracts any embedded PDF text separately. In
+`adaptive` OCR mode (the default), Tesseract runs only on pages whose embedded
+text is missing or too weak; set `BOOK2EPUB_OCR_MODE=full` to run both sources
+on every page. Correction receives the embedded text, layout text, OCR, and
+page image as separate evidence and records which source it selected.
+Structure first detects and parses a likely table of contents from assembled
+text, confirming candidate pages with their images. When at least 80% of entries
+and all numbered chapters match body headings in order, the TOC becomes the
+authoritative hierarchy and broad refinement is skipped. Otherwise the stage
+uses bounded consecutive-heading batches; each request is capped at 40,000
+serialized bytes and may request focused unit evidence. A compact global pass
+checks chapter order, parent links, and front/main/back boundaries. Completed
+batch responses are reused on Resume; invalid proposals cannot replace the
+accepted tree. Refinement calls make at most three attempts before reporting a
+failure. Ten total rounds are the default; `BOOK2EPUB_STRUCTURE_MAX_ROUNDS` may
+be set lower, up to ten.
 
 Each hosted model attempt is also appended to
 `PROJECT/logs/model_requests.jsonl`. Entries include the input text, output
@@ -117,7 +138,7 @@ metadata. API keys are never written to this log.
 
 Run `python -m book2epub structure PROJECT` after assembly to infer a
 chapter/section hierarchy. This compatibility command runs discovery and then
-whole-tree refinement. The phases can also be run independently with
+batched refinement. The phases can also be run independently with
 `structure-discovery` and `structure-refinement`; inspect saved versions at
 `http://127.0.0.1:8765/structure`.
 

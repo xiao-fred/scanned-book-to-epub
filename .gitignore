@@ -5,3 +5,6 @@ __pycache__/
 .env.*
 !.env-template
 *.db
+projects/*
+!projects/.gitkeep
+.DS_Store
